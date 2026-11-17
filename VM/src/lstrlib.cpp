@@ -3,6 +3,7 @@
 #include "lualib.h"
 
 #include "lstring.h"
+#include "lnumutils.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -1563,7 +1564,7 @@ static int str_format(lua_State* L)
             {
             case 'c':
             {
-                int count = snprintf(buff, sizeof(buff), form, (int)luaL_checknumber(L, arg));
+                int count = snprintf(buff, sizeof(buff), form, luai_numtoint(luaL_checknumber(L, arg)));
                 luaL_addlstring(&b, buff, count);
                 continue; // skip the 'luaL_addlstring' at the end
             }
@@ -1571,7 +1572,7 @@ static int str_format(lua_State* L)
             case 'i':
             {
                 addInt64Format(form, formatIndicator, formatItemSize);
-                snprintf(buff, sizeof(buff), form, static_cast<long long>(luaL_checknumber(L, arg)));
+                snprintf(buff, sizeof(buff), form, static_cast<long long>(luai_numtoint64(luaL_checknumber(L, arg))));
                 break;
             }
             case 'o':
@@ -1581,7 +1582,9 @@ static int str_format(lua_State* L)
             {
                 double argValue = luaL_checknumber(L, arg);
                 addInt64Format(form, formatIndicator, formatItemSize);
-                unsigned long long v = (argValue < 0) ? (unsigned long long)(long long)argValue : (unsigned long long)argValue;
+                // values in [2^63, 2^64) only fit in unsigned long long; the rest converts as a signed 64-bit integer
+                bool unsignedonly = argValue >= 9223372036854775808.0 && argValue < 18446744073709551616.0;
+                unsigned long long v = unsignedonly ? (unsigned long long)argValue : (unsigned long long)luai_numtoint64(argValue);
                 snprintf(buff, sizeof(buff), form, v);
                 break;
             }
@@ -2119,7 +2122,7 @@ static int str_pack(lua_State* L)
         {
         case Kint:
         { // signed integers
-            long long n = (long long)luaL_checknumber(L, arg);
+            long long n = luai_numtoint64(luaL_checknumber(L, arg));
             if (size < SZINT)
             { // need overflow check?
                 long long lim = (long long)1 << ((size * NB) - 1);
@@ -2130,7 +2133,7 @@ static int str_pack(lua_State* L)
         }
         case Kuint:
         { // unsigned integers
-            long long n = (long long)luaL_checknumber(L, arg);
+            long long n = luai_numtoint64(luaL_checknumber(L, arg));
             if (size < SZINT) // need overflow check?
                 luaL_argcheck(L, (unsigned long long)n < ((unsigned long long)1 << (size * NB)), arg, "unsigned overflow");
             packint(&b, (unsigned long long)n, h.islittle, size, 0);

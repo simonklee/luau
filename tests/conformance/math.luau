@@ -526,4 +526,18 @@ assert(math.isnan("123.45") == false)
 assert(math.isinf("123.45") == false)
 assert(math.isfinite("123.45") == true)
 
+-- exponents and noise coordinates that don't fit in an int (or NaN)
+do
+  local function id(x) return x end
+
+  for _, v in {id(2^31), id(-2^31 - 1), id(2^32 + 3), id(2^63), id(-2^63), id(2^64), id(1e300), id(math.huge), id(-math.huge), id(0/0)} do
+    assert(math.ldexp(1, v) == 0)
+  end
+
+  -- multiples of 256 are lattice points with or without FixMathNoisePrecision
+  for _, v in {id(2^31), id(-2^31 - 256), id(2^40), id(2^63), id(-2^63), id(2^64)} do
+    assert(math.noise(v, v, v) == 0)
+  end
+end
+
 return('OK')

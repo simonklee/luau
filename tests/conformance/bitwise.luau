@@ -264,4 +264,39 @@ assert(bit32.countrz("42") == 1)
 assert(bit32.extract("42", 1, 3) == 5)
 assert(bit32.byteswap("0xa1b2c3d4") == 0xd4c3b2a1)
 
+-- numbers within 64-bit integer range wrap around, numbers outside of it (and NaN) convert to 0
+do
+  local function id(x) return x end
+
+  for _, v in {id(2^63), id(-2^63), id(2^64), id(1e300), id(math.huge), id(-math.huge), id(0/0)} do
+    assert(bit32.bor(v) == 0)
+    assert(bit32.band(v, 0xffffffff) == 0)
+    assert(bit32.bxor(v, 1) == 1)
+    assert(bit32.lshift(v, 1) == 0)
+    assert(bit32.countlz(v) == 32)
+    assert(select(2, pcall(bit32.bor, v)) == 0)
+  end
+
+  assert(bit32.bor(id(2^53 + 2)) == 2)
+  assert(bit32.bor(id(2^63 - 1024)) == 0xfffffc00)
+  assert(select(2, pcall(bit32.bor, id(2^53 + 2))) == 2)
+end
+
+-- shift, rotate and field arguments that don't fit in an int (or NaN) take the generic path
+do
+  local function id(x) return x end
+
+  for _, v in {id(2^31), id(-2^31 - 1), id(2^32 + 3), id(2^63), id(-2^63), id(2^64), id(1e300), id(math.huge), id(-math.huge), id(0/0)} do
+    assert(bit32.arshift(-8, v) == 0)
+    assert(bit32.lshift(1, v) == 0)
+    assert(bit32.rshift(0x80000000, v) == 0)
+    assert(bit32.lrotate(3, v) == 3)
+    assert(bit32.rrotate(3, v) == 3)
+    assert(not pcall(bit32.extract, 0xff, v))
+    assert(not pcall(bit32.extract, 0xff, 0, v))
+    assert(not pcall(bit32.replace, 0, 1, v))
+    assert(not pcall(bit32.replace, 0, 1, 0, v))
+  end
+end
+
 return('OK')

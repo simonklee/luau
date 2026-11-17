@@ -3,6 +3,7 @@
 
 #include "lcommon.h"
 #include "lbuffer.h"
+#include "lnumutils.h"
 
 #if defined(LUAU_BIG_ENDIAN)
 #include <endian.h>
@@ -318,7 +319,7 @@ static int buffer_readbits(lua_State* L)
 {
     size_t len = 0;
     void* buf = luaL_checkbuffer(L, 1, &len);
-    int64_t bitoffset = (int64_t)luaL_checknumber(L, 2);
+    int64_t bitoffset = luai_numtoint64(luaL_checknumber(L, 2));
     int bitcount = luaL_checkinteger(L, 3);
 
     if (bitoffset < 0)
@@ -353,7 +354,7 @@ static int buffer_writebits(lua_State* L)
 {
     size_t len = 0;
     void* buf = luaL_checkbuffer(L, 1, &len);
-    int64_t bitoffset = (int64_t)luaL_checknumber(L, 2);
+    int64_t bitoffset = luai_numtoint64(luaL_checknumber(L, 2));
     int bitcount = luaL_checkinteger(L, 3);
     unsigned value = luaL_checkunsigned(L, 4);
 

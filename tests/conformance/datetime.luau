@@ -103,4 +103,17 @@ assert(os.difftime(t1,t2) == 60*2-19)
 
 assert(os.time({ year = 1970, day = 1, month = 1, hour = 0}) == 0)
 
+-- times that don't fit in 64 bits (or NaN) convert to the minimum 64-bit integer
+-- (the differences only use non-negative times or equal times: the Windows CRT rejects negative times in difftime)
+do
+  local function id(x) return x end
+
+  assert(os.difftime(id(2^31), 0) == 2^31)
+  assert(os.difftime(id(2^31), id(2^31 - 1)) == 1)
+  for _, v in {id(2^63), id(-2^63), id(2^64), id(1e300), id(math.huge), id(-math.huge), id(0/0)} do
+    assert(os.difftime(v, v) == 0)
+    assert(os.date("!%Y", v) == nil)
+  end
+end
+
 return 'OK'

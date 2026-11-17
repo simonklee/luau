@@ -568,6 +568,35 @@ assert(os.setlocale() == 'C')
 assert(os.setlocale(nil, "numeric") == 'C')
 ]]--
 
+-- positions, characters and integer formats that don't fit in an int (or NaN)
+do
+  local function id(x) return x end
+
+  for _, v in {id(2^31), id(-2^31 - 1), id(2^32 + 3), id(2^63), id(-2^63), id(2^64), id(1e300), id(math.huge), id(-math.huge), id(0/0)} do
+    assert(string.byte("abc", v) == nil)
+    assert(string.byte("abc", 1, v) == nil)
+    assert(not pcall(string.char, v))
+    assert(string.sub("abc", v) == "abc")
+    assert(string.sub("abc", 1, v) == "")
+    assert(select("#", table.unpack({1, 2, 3}, 1, v)) == 0)
+    assert(not pcall(select, v, "a", "b"))
+    assert(string.format("%c", v) == "\0")
+    assert(not pcall(string.pack, "i4", v))
+  end
+
+  -- integers out of the 64-bit range (and NaN) format as the minimum 64-bit integer
+  assert(string.format("%d", id(2^31)) == "2147483648")
+  assert(string.format("%d", id(-2^31 - 1)) == "-2147483649")
+  assert(string.format("%x", id(-2^31 - 1)) == "ffffffff7fffffff")
+  assert(string.format("%x", id(2^63)) == "8000000000000000")
+  assert(string.format("%x", id(2^64 - 2048)) == "fffffffffffff800")
+  for _, v in {id(2^64), id(1e300), id(math.huge), id(-math.huge), id(0/0), id(-2^63)} do
+    assert(string.format("%d", v) == "-9223372036854775808")
+    assert(string.format("%x", v) == "8000000000000000")
+    assert(string.format("%o", v) == "1000000000000000000000")
+  end
+end
+
 return('OK')
 
 
