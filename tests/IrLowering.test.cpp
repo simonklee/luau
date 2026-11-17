@@ -4739,7 +4739,7 @@ bb_bytecode_1:
   %21 = ADD_INT %16, 4i
   CHECK_CMP_INT %16, 0i, ge, bb_exit_4
    ; exit sync: R5, {}
-  CHECK_CMP_INT %21, 32i, le, bb_exit_5
+  CHECK_CMP_INT %21, 32i, u_le, bb_exit_5
    ; exit sync: R5, {}
   %28 = BITRSHIFT_UINT %15, %16
   %29 = BITAND_UINT %28, 15i
