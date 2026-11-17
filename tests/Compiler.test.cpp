@@ -10554,6 +10554,116 @@ RETURN R0 59
     );
 }
 
+TEST_CASE("BuiltinFoldingOutOfRange")
+{
+    // numbers out of the 64-bit range (and NaN) fold to 0, like they convert at runtime
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+return bit32.bor(1e300), bit32.bor(-1e300), bit32.bor(0/0), bit32.bor(2^64), bit32.bor(2^63), bit32.bor(2^63 - 1024)
+)",
+                   0,
+                   2
+               ),
+        R"(
+LOADN R0 0
+LOADN R1 0
+LOADN R2 0
+LOADN R3 0
+LOADN R4 0
+LOADK R5 K0 [4294966272]
+RETURN R0 6
+)"
+    );
+
+    // shift counts, fields and positions out of the int range (and NaN) fold like they run, or aren't folded
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+return math.ldexp(1, 1e300), bit32.lrotate(3, 1e300), bit32.rrotate(3, -2^31), bit32.lshift(1, 1e300), bit32.extract(255, 2^31 - 1, 2^31 - 1),
+    string.byte("abc", 1e300)
+)",
+                   0,
+                   2
+               ),
+        R"(
+LOADN R0 0
+LOADN R1 3
+LOADN R2 3
+LOADN R4 1
+FASTCALL2K 36 R4 K0 L0 [1.0000000000000001e+300]
+LOADK R5 K0 [1.0000000000000001e+300]
+GETIMPORT R3 3 [bit32.lshift]
+CALL R3 2 1
+L0: LOADN R5 255
+LOADK R6 K4 [2147483647]
+LOADK R7 K4 [2147483647]
+FASTCALL 34 L1
+GETIMPORT R4 6 [bit32.extract]
+CALL R4 3 1
+L1: LOADK R6 K7 ['abc']
+FASTCALL2K 41 R6 K0 L2 [1.0000000000000001e+300]
+LOADK R7 K0 [1.0000000000000001e+300]
+GETIMPORT R5 10 [string.byte]
+CALL R5 2 -1
+L2: RETURN R0 -1
+)"
+    );
+
+    // a character code out of the int range isn't folded; a fraction truncates as at runtime
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+return string.char(1e300), string.char(65.5)
+)",
+                   0,
+                   2
+               ),
+        R"(
+LOADK R1 K0 [1.0000000000000001e+300]
+FASTCALL1 42 R1 L0
+GETIMPORT R0 3 [string.char]
+CALL R0 1 1
+L0: LOADK R1 K4 ['A']
+RETURN R0 2
+)"
+    );
+
+    // field and width that can't be in range don't use the constant extract, and don't overflow
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local a = ...
+return bit32.extract(a, 2147483647, 2147483647), bit32.extract(a, 1e300, 1), bit32.extract(a, 31, 1)
+)",
+                   0,
+                   2
+               ),
+        R"(
+GETVARARGS R0 1
+LOADK R3 K0 [2147483647]
+LOADK R4 K0 [2147483647]
+FASTCALL3 34 R0 R3 R4 L0
+MOVE R2 R0
+GETIMPORT R1 3 [bit32.extract]
+CALL R1 3 1
+L0: LOADK R4 K4 [1.0000000000000001e+300]
+LOADN R5 1
+FASTCALL3 34 R0 R4 R5 L1
+MOVE R3 R0
+GETIMPORT R2 3 [bit32.extract]
+CALL R2 3 1
+L1: FASTCALL2K 59 R0 K5 L2 [31]
+MOVE R4 R0
+LOADK R5 K5 [31]
+LOADK R6 K6 [1]
+GETIMPORT R3 3 [bit32.extract]
+CALL R3 3 1
+L2: RETURN R1 3
+)"
+    );
+}
+
 TEST_CASE("BuiltinFoldingProhibited")
 {
     CHECK_EQ(
