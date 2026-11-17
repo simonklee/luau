@@ -22,12 +22,18 @@ static tm* localtime_r(const time_t* timep, tm* result)
 }
 #endif
 
+// date fields can be any int, so int arithmetic on them is done in 64 bits and truncated, which wraps around without signed overflow
+static int wrapint(int64_t v)
+{
+    return int(uint32_t(v));
+}
+
 static time_t os_timegm(struct tm* timep)
 {
     // Julian day number calculation
     int day = timep->tm_mday;
-    int month = timep->tm_mon + 1;
-    int year = timep->tm_year + 1900;
+    int month = wrapint(int64_t(timep->tm_mon) + 1);
+    int year = wrapint(int64_t(timep->tm_year) + 1900);
 
     // year adjustment, pretend that it starts in March
     int a = timep->tm_mon % 12 < 2 ? 1 : 0;
@@ -35,10 +41,10 @@ static time_t os_timegm(struct tm* timep)
     // also adjust for out-of-range month numbers in input
     a -= timep->tm_mon / 12;
 
-    int y = year + 4800 - a;
-    int m = month + (12 * a) - 3;
+    int y = wrapint(int64_t(year) + 4800 - a);
+    int m = wrapint(int64_t(month) + (12 * int64_t(a)) - 3);
 
-    int julianday = day + ((153 * m + 2) / 5) + (365 * y) + (y / 4) - (y / 100) + (y / 400) - 32045;
+    int julianday = wrapint(int64_t(day) + (wrapint(153 * int64_t(m) + 2) / 5) + (365 * int64_t(y)) + (y / 4) - (y / 100) + (y / 400) - 32045);
 
     const int utcstartasjulianday = 2440588;                              // Jan 1st 1970 offset in Julian calendar
     const int64_t utcstartasjuliansecond = utcstartasjulianday * 86400ll; // same in seconds
@@ -140,7 +146,7 @@ static int os_date(lua_State* L)
         setfield(L, "hour", stm->tm_hour);
         setfield(L, "day", stm->tm_mday);
         setfield(L, "month", stm->tm_mon + 1);
-        setfield(L, "year", stm->tm_year + 1900);
+        setfield(L, "year", wrapint(int64_t(stm->tm_year) + 1900));
         setfield(L, "wday", stm->tm_wday + 1);
         setfield(L, "yday", stm->tm_yday + 1);
         setboolfield(L, "isdst", stm->tm_isdst);
@@ -191,8 +197,8 @@ static int os_time(lua_State* L)
         ts.tm_min = getfield(L, "min", 0);
         ts.tm_hour = getfield(L, "hour", 12);
         ts.tm_mday = getfield(L, "day", -1);
-        ts.tm_mon = getfield(L, "month", -1) - 1;
-        ts.tm_year = getfield(L, "year", -1) - 1900;
+        ts.tm_mon = wrapint(int64_t(getfield(L, "month", -1)) - 1);
+        ts.tm_year = wrapint(int64_t(getfield(L, "year", -1)) - 1900);
         ts.tm_isdst = getboolfield(L, "isdst");
 
         // Note: upstream Lua uses mktime() here which assumes input is local time, but we prefer UTC for consistency
