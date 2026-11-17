@@ -13,7 +13,7 @@
 #endif
 
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringSplit, false)
-LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringGsub, false)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringGsub, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauLinearStringSearch, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauPatternBudget, true)
 
