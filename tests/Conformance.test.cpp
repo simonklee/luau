@@ -74,6 +74,9 @@ LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
 LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
 LUAU_FASTFLAG(LuauGcTraceUdata)
 LUAU_DYNAMIC_FASTFLAG(LuauGcHeapShrinkFix)
+LUAU_DYNAMIC_FASTFLAG(LuauLinearStringSearch)
+LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringGsub)
+LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringSplit)
 LUAU_FASTFLAG(LuauPcallErrorContinuationReentry)
 LUAU_FASTFLAG(LuauExperimentalIfLocalSyntax)
 LUAU_FASTFLAG(LuauSandboxFreezesVectorMetatable)
@@ -1460,6 +1463,37 @@ TEST_CASE("Clear")
 TEST_CASE("Strings")
 {
     runConformance("strings.luau");
+}
+
+TEST_CASE("StringSearchLinear")
+{
+    for (bool linearStringSearch : {false, true})
+    {
+        for (bool optimizeStringGsub : {false, true})
+        {
+            for (bool optimizeStringSplit : {false, true})
+            {
+                ScopedFastFlag luauLinearStringSearch{DFFlag::LuauLinearStringSearch, linearStringSearch};
+                ScopedFastFlag luauOptimizeStringGsub{DFFlag::LuauOptimizeStringGsub, optimizeStringGsub};
+                ScopedFastFlag luauOptimizeStringSplit{DFFlag::LuauOptimizeStringSplit, optimizeStringSplit};
+
+                runConformance("strings.luau");
+
+                // the worst cases take seconds without the linear search
+                if (linearStringSearch)
+                {
+                    runConformance(
+                        "stringsearch.luau",
+                        [](lua_State* L)
+                        {
+                            lua_pushboolean(L, DFFlag::LuauOptimizeStringGsub);
+                            lua_setglobal(L, "optimizestringgsub");
+                        }
+                    );
+                }
+            }
+        }
+    }
 }
 
 TEST_CASE("StringInterp")
