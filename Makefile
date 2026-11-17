@@ -139,8 +139,8 @@ ifeq ($(config),analyze)
 endif
 
 ifeq ($(config),fuzz)
-	CXXFLAGS+=-fsanitize=address,fuzzer -Ibuild/libprotobuf-mutator -O2
-	LDFLAGS+=-fsanitize=address,fuzzer
+	CXXFLAGS+=-fsanitize=address,undefined,fuzzer -Ibuild/libprotobuf-mutator -O2
+	LDFLAGS+=-fsanitize=address,undefined,fuzzer
 	LPROTOBUF=-lprotobuf
 	DPROTOBUF=-D CMAKE_BUILD_TYPE=Release -D LIB_PROTO_MUTATOR_TESTING=OFF
 	EPROTOC=protoc
