@@ -3523,6 +3523,55 @@ static bool endsWith(const std::string& str, const std::string& suffix)
     return suffix == std::string_view(str.c_str() + str.length() - suffix.length(), suffix.length());
 }
 
+TEST_CASE("ApiNumberConversion")
+{
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+
+    struct Case
+    {
+        double value;
+        int i;
+        unsigned u;
+    };
+
+    // numbers outside of the int range (and NaN) convert to INT_MIN; numbers outside of the 64-bit integer range (and NaN) convert to 0 unsigned
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const Case cases[] = {
+        {1.5, 1, 1},
+        {-1.5, -1, ~0u},
+        {2147483647.5, INT_MAX, 0x7fffffffu},
+        {-2147483648.0, INT_MIN, 0x80000000u},
+        {2147483648.0, INT_MIN, 0x80000000u},
+        {-2147483649.0, INT_MIN, 0x7fffffffu},
+        {4294967301.0, INT_MIN, 5u},
+        {9223372036854774784.0, INT_MIN, 0xfffffc00u},
+        {9223372036854775808.0, INT_MIN, 0},
+        {-9223372036854775808.0, INT_MIN, 0},
+        {1e300, INT_MIN, 0},
+        {inf, INT_MIN, 0},
+        {-inf, INT_MIN, 0},
+        {nan, INT_MIN, 0},
+    };
+
+    for (const Case& c : cases)
+    {
+        lua_pushnumber(L, c.value);
+        int isnum = 0;
+        CHECK_EQ(lua_tointegerx(L, -1, &isnum), c.i);
+        CHECK(isnum == 1);
+        unsigned u = lua_tounsignedx(L, -1, &isnum);
+        CHECK(isnum == 1);
+        // 32-bit MSVC converts to unsigned with x87 fistp, which rounds fractions in the current rounding mode
+#if defined(_MSC_VER) && defined(_M_IX86)
+        if (floor(c.value) == c.value || c.value != c.value)
+#endif
+            CHECK_EQ(u, c.u);
+        lua_pop(L, 1);
+    }
+}
+
 TEST_CASE("ApiType")
 {
     StateRef globalState(luaL_newstate(), lua_close);

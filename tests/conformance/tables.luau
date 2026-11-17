@@ -1107,4 +1107,57 @@ do
   setallocationlimit(0)
 end
 
+-- numeric keys that don't fit in an int (or NaN) are hash keys and never alias an array index
+do
+  local function id(x) return x end
+  local big = { id(2^31), id(-2^31 - 1), id(2^32 + 1), id(2^53), id(-2^63), id(1e300), id(math.huge), id(-math.huge) }
+  local nan = id(0/0)
+
+  local t = table.create(4)
+  t[1] = "one"
+
+  for i, k in big do
+    assert(t[k] == nil)
+    assert(rawget(t, k) == nil)
+    t[k] = i
+    assert(t[k] == i)
+    assert(rawget(t, k) == i)
+  end
+
+  assert(t[nan] == nil)
+  assert(rawget(t, nan) == nil)
+  assert(not pcall(function() t[nan] = 1 end))
+  assert(not pcall(rawset, t, nan, 1))
+
+  -- -2^31 fits and is still not an array index
+  t[id(-2^31)] = "min"
+  assert(t[id(-2^31)] == "min")
+  assert(t[1] == "one")
+
+  -- traversal and rehash go through the same conversion
+  local count = 0
+  for k, v in t do
+    count += 1
+    assert(t[k] == v)
+  end
+  assert(count == #big + 2)
+
+  for i = 2, 100 do
+    t[i] = i
+  end
+  for i, k in big do
+    assert(t[k] == i)
+  end
+  assert(#t == 100)
+  local nk = next(t, id(2^31))
+  assert(nk == nil or t[nk] ~= nil)
+  assert(not pcall(next, t, id(2^40)))
+
+  -- sizes that don't fit in an int are out of range
+  assert(not pcall(table.create, id(2^31)))
+  assert(not pcall(table.create, nan))
+  assert(not pcall(function() return table.create(id(2^31)) end))
+  assert(not pcall(function() return table.create(nan) end))
+end
+
 return "OK"

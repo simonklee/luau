@@ -890,6 +890,29 @@ do
   bitops(1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024)
 end
 
+-- offsets that don't fit in an int (or NaN) are out of bounds
+local function boundchecksoutofrange(...)
+  local b = buffer.create(16)
+
+  for _, offset in {...} do
+    assert(ecall(function() buffer.readi8(b, offset) end) == "buffer access out of bounds")
+    assert(ecall(function() buffer.readu16(b, offset) end) == "buffer access out of bounds")
+    assert(ecall(function() buffer.readi32(b, offset) end) == "buffer access out of bounds")
+    assert(ecall(function() buffer.readf64(b, offset) end) == "buffer access out of bounds")
+    assert(ecall(function() buffer.writei8(b, offset, 0) end) == "buffer access out of bounds")
+    assert(ecall(function() buffer.writeu16(b, offset, 0) end) == "buffer access out of bounds")
+    assert(ecall(function() buffer.writei32(b, offset, 0) end) == "buffer access out of bounds")
+    assert(ecall(function() buffer.writef64(b, offset, 0) end) == "buffer access out of bounds")
+    assert(ecall(buffer.readi8, b, offset) == "buffer access out of bounds")
+    assert(ecall(buffer.writei8, b, offset, 0) == "buffer access out of bounds")
+    assert(ecall(buffer.readbits, b, offset, 1) == "buffer access out of bounds")
+    assert(ecall(buffer.writebits, b, offset, 1, 0) == "buffer access out of bounds")
+  end
+end
+
+boundchecksoutofrange(2^31, -2^31 - 1, 2^32, 2^32 + 1, 1e300, math.huge, -math.huge, 0/0)
+boundchecksoutofrange(2^63, -2^63, 2^64)
+
 local function testslowcalls()
   getfenv()
 
@@ -902,6 +925,7 @@ local function testslowcalls()
   createchecks()
   boundchecks()
   boundchecksnonconst(1024, -1, -100000, 0x7fffffff)
+  boundchecksoutofrange(2^31, -2^31 - 1, 2^32, 2^32 + 1, 1e300, math.huge, -math.huge, 0/0)
   boundcheckssmall()
   boundcheckssmallnonconst(0, 1, -1, -2, -4, -7, -8)
   boundchecksempty()
