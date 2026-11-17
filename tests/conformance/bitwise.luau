@@ -297,6 +297,36 @@ do
     assert(not pcall(bit32.replace, 0, 1, v))
     assert(not pcall(bit32.replace, 0, 1, 0, v))
   end
+
+  -- field + width past the int range is out of range, not an overflow
+  for _, fw in {{id(2^31 - 1), nil}, {id(2^31 - 1), id(1)}, {id(1), id(2^31 - 1)}, {id(2^31 - 31), id(2^31 - 31)}} do
+    assert(not pcall(bit32.extract, 0xffffffff, fw[1], fw[2]))
+    assert(not pcall(bit32.replace, 0, 1, fw[1], fw[2]))
+  end
+  assert(bit32.extract(0xffffffff, id(31), id(1)) == 1)
+  assert(bit32.replace(0, 1, id(31), id(1)) == 0x80000000)
+
+  -- the same through direct calls with a single result, which are fast calls (and native code under codegen)
+  local function e(x, f, w) return (bit32.extract(x, f, w)) end
+  local function r(n, v, f, w) return (bit32.replace(n, v, f, w)) end
+  for _, fw in {{2^31 - 1, 1}, {1, 2^31 - 1}, {2^31 - 31, 2^31 - 31}, {32, 1}} do
+    assert(not pcall(e, 0xffffffff, fw[1], fw[2]))
+    assert(not pcall(r, 0, 3, fw[1], fw[2]))
+  end
+  assert(e(0xffffffff, 31, 1) == 1)
+  assert(r(0, 3, 31, 1) == 0x80000000)
+
+  -- rotating by -2^31 or 2^31 is a multiple of 32
+  assert(bit32.rrotate(3, id(-2^31)) == 3)
+  assert(bit32.lrotate(3, id(-2^31)) == 3)
+  assert(bit32.rrotate(3, id(-5)) == 96)
+  assert(bit32.rrotate(3, id(5)) == 0x18000000)
+  assert(select(2, pcall(bit32.rrotate, 3, id(-2^31))) == 3)
+  assert(select(2, pcall(bit32.rrotate, 3, id(-5))) == 96)
+  assert(select(2, pcall(bit32.arshift, -8, id(2^31))) == 0)
+  assert(select(2, pcall(bit32.arshift, -8, id(-2^31))) == 0)
+  assert(select(2, pcall(bit32.rshift, 8, id(-2^31))) == 0)
+  assert(select(2, pcall(bit32.lshift, 8, id(-2^31))) == 0)
 end
 
 return('OK')
