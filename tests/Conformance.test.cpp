@@ -79,6 +79,7 @@ LUAU_DYNAMIC_FASTFLAG(LuauGcHeapShrinkFix)
 LUAU_DYNAMIC_FASTFLAG(LuauLinearStringSearch)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringGsub)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringSplit)
+LUAU_DYNAMIC_FASTFLAG(LuauTableSortInterrupt)
 LUAU_FASTFLAG(LuauPcallErrorContinuationReentry)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
 LUAU_FASTFLAG(LuauExperimentalIfLocalSyntax)
@@ -1450,7 +1451,19 @@ TEST_CASE("PatternMatch")
 
 TEST_CASE("Sort")
 {
-    runConformance("sort.luau");
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTableSortInterrupt{DFFlag::LuauTableSortInterrupt, enabled};
+
+        // an interrupt must not change any result
+        runConformance(
+            "sort.luau",
+            [](lua_State* L)
+            {
+                lua_callbacks(L)->interrupt = [](lua_State* L, int gc) {};
+            }
+        );
+    }
 }
 
 TEST_CASE("Move")
@@ -4283,6 +4296,424 @@ TEST_CASE("Interrupt")
 
         lua_pop(L, 1);
     }
+}
+
+TEST_CASE("InterruptTableSort")
+{
+    enum class Action
+    {
+        Error,
+        Yield,
+        Freeze,
+    };
+
+    static int hits;
+    static int limit;
+    static Action action;
+    static int comparatorhits[2];
+
+    const std::string source = R"(
+local mt = { __lt = function(a, b) return a.v < b.v end }
+
+function rawlessthan(a, b) return a < b end
+
+-- n distinct values 0..n-1 in a scrambled order
+function numbers(n)
+    local t = table.create(n)
+    for i = 1, n do t[i] = (i * 7919) % n end
+    return t
+end
+
+-- a sequence that makes quicksort fall back to heap sort; see sort.luau
+function killer(n)
+    local keys = {}
+    local candidate = 0
+    local nextkey = 0
+
+    local t = table.create(n, 0)
+    for k in t do t[k] = k end
+
+    table.sort(t, function(x, y)
+        if keys[x] == nil and keys[y] == nil then
+            if x == candidate then keys[x] = nextkey else keys[y] = nextkey end
+            nextkey += 1
+        end
+        if keys[x] == nil then candidate = x; return true end
+        if keys[y] == nil then candidate = y; return false end
+        return keys[x] < keys[y]
+    end)
+
+    local arr = table.create(n)
+    for k, v in t do arr[v] = k - 1 end
+    return arr
+end
+
+function objects(n)
+    local t = table.create(n)
+    for i = 1, n do t[i] = setmetatable({ v = (i * 7919) % n }, mt) end
+    return t
+end
+
+-- objects whose __lt is a C function, which runs no bytecode; rawequal is false for distinct objects
+function cobjects(n)
+    local cmt = { __lt = rawequal }
+    local t = table.create(n)
+    for i = 1, n do t[i] = setmetatable({ v = i - 1 }, cmt) end
+    return t
+end
+
+-- n references to two strings that share a 256 KiB prefix, so each comparison of the two is a long memcmp
+local prefix = string.rep("p", 256 * 1024)
+local s0, s1 = prefix .. "0", prefix .. "1"
+
+function longstrings(n)
+    local t = table.create(n)
+    for i = 1, n do t[i] = if (i * 7919) % 3 == 0 then s0 else s1 end
+    return t
+end
+
+-- distinct strings with a 1 KiB common prefix in the order of killer(n), so heap sort compares long strings
+function killerstrings(n)
+    local p = string.rep("k", 1024)
+    local t = killer(n)
+    for i = 1, n do t[i] = p .. string.format("%08d", t[i]) end
+    return t
+end
+
+-- objects whose __lt freezes the table being sorted (sorting, set by the test)
+function freezers(n)
+    local fmt = { __lt = function(a, b)
+        if not table.isfrozen(sorting) then table.freeze(sorting) end
+        return a.v < b.v
+    end }
+    local t = table.create(n)
+    for i = 1, n do t[i] = setmetatable({ v = (i * 7919) % n }, fmt) end
+    return t
+end
+
+-- a comparator that freezes the table being sorted
+function freezingless(a, b)
+    if not table.isfrozen(sorting) then table.freeze(sorting) end
+    return a < b
+end
+
+-- how many times t holds each of its elements
+function snapshot(t)
+    local counts = {}
+    for _, v in t do counts[v] = (counts[v] or 0) + 1 end
+    return counts
+end
+
+local function key(v)
+    return if type(v) == "table" then v.v else v
+end
+
+-- t holds the n elements counted by snapshot, each as many times, and in order if sorted is set
+function check(t, counts, n, sorted)
+    assert(#t == n)
+    local left = table.clone(counts)
+    for i = 1, n do
+        local v = t[i]
+        assert((left[v] or 0) > 0)
+        left[v] -= 1
+        assert(not sorted or i == 1 or key(t[i - 1]) <= key(v))
+    end
+end
+)";
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTableSortInterrupt{DFFlag::LuauTableSortInterrupt, enabled};
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+
+        luaL_openlibs(L);
+
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
+        int result = luau_load(L, "=InterruptTableSort", bytecode, bytecodeSize, 0);
+        free(bytecode);
+
+        REQUIRE(result == LUA_OK);
+        REQUIRE(lua_pcall(L, 0, 0, 0) == LUA_OK);
+
+        lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+        {
+            if (gc >= 0 || limit < 0)
+                return;
+
+            if (++hits == limit)
+            {
+                if (action == Action::Yield)
+                    lua_yield(L, 0);
+                else if (action == Action::Freeze)
+                    lua_setreadonly(L, 1, true); // the table being sorted
+                else
+                    luaL_error(L, "timeout");
+            }
+        };
+
+        // pushes generator(n) and its snapshot, as counts and then the table, with the interrupt off
+        auto generate = [](lua_State* L, const char* generator, int n)
+        {
+            limit = -1;
+
+            lua_getglobal(L, generator);
+            lua_pushinteger(L, n);
+            REQUIRE(lua_pcall(L, 1, 1, 0) == LUA_OK);
+
+            lua_pushvalue(L, -1);
+            lua_setglobal(L, "sorting");
+
+            lua_getglobal(L, "snapshot");
+            lua_pushvalue(L, -2);
+            REQUIRE(lua_pcall(L, 1, 1, 0) == LUA_OK);
+            lua_insert(L, -2);
+        };
+
+        // sorts generator(n) with the interrupt on, and returns the status; leaves the error, if any, above the table
+        auto sort = [&](lua_State* L, const char* generator, int n, int stop, Action stopaction = Action::Error,
+                        const char* comparator = nullptr)
+        {
+            generate(L, generator, n);
+
+            lua_getglobal(L, "table");
+            lua_getfield(L, -1, "sort");
+            lua_remove(L, -2);
+            lua_pushvalue(L, -2);
+            if (comparator)
+                lua_getglobal(L, comparator);
+
+            hits = 0;
+            limit = stop;
+            action = stopaction;
+            int status = lua_pcall(L, comparator ? 2 : 1, 0, 0);
+            limit = -1;
+            return status;
+        };
+
+        // the same, with table.sort called directly by lua_resume on a new coroutine, where a C function could yield
+        auto sortthread = [&](lua_State* L, const char* generator, int n, int stop, Action stopaction)
+        {
+            generate(L, generator, n);
+
+            lua_State* T = lua_newthread(L);
+            lua_getglobal(T, "table");
+            lua_getfield(T, -1, "sort");
+            lua_remove(T, -2);
+            lua_pushvalue(L, -2);
+            lua_xmove(L, T, 1);
+
+            hits = 0;
+            limit = stop;
+            action = stopaction;
+            int status = lua_resume(T, nullptr, 1);
+            limit = -1;
+
+            if (status != LUA_OK)
+                lua_xmove(T, L, 1); // the error
+
+            lua_remove(L, status != LUA_OK ? -2 : -1); // the coroutine
+            return status;
+        };
+
+        // checks and pops the table and its counts
+        auto check = [](lua_State* L, int n, bool sorted)
+        {
+            lua_getglobal(L, "check");
+            lua_pushvalue(L, -2);
+            lua_pushvalue(L, -4);
+            lua_pushinteger(L, n);
+            lua_pushboolean(L, sorted);
+            CHECK(lua_pcall(L, 4, 0, 0) == LUA_OK);
+            lua_pop(L, 2);
+        };
+
+        auto checkerror = [](lua_State* L, const char* message)
+        {
+            REQUIRE(lua_type(L, -1) == LUA_TSTRING);
+            CHECK(strcmp(lua_tostring(L, -1), message) == 0);
+            lua_pop(L, 1);
+        };
+
+        // the check itself finds a missing element and a duplicate
+        generate(L, "numbers", 3);
+        lua_pushnumber(L, 1);
+        lua_rawseti(L, -2, 1);
+        lua_pushnumber(L, 1);
+        lua_rawseti(L, -2, 2);
+        lua_getglobal(L, "check");
+        lua_pushvalue(L, -2);
+        lua_pushvalue(L, -4);
+        lua_pushinteger(L, 3);
+        lua_pushboolean(L, false);
+        CHECK(lua_pcall(L, 4, 0, 0) == LUA_ERRRUN);
+        lua_settop(L, 0);
+
+        const int n = 100'000;
+
+        // without a comparator, the sort runs no bytecode; only the flag makes it reach the interrupt, after each partition
+        // of 256 or more elements
+        CHECK(sort(L, "numbers", n, 0) == LUA_OK);
+        if (enabled)
+            CHECK(hits > n / 512);
+        else
+            CHECK(hits == 0);
+        check(L, n, true);
+
+        for (int size : {255, 256, 257})
+        {
+            CHECK(sort(L, "numbers", size, 0) == LUA_OK);
+            CHECK(hits == (enabled && size >= 256 ? 1 : 0));
+            check(L, size, true);
+        }
+
+        // an error from the interrupt stops the sort and leaves the table partly sorted
+        if (enabled)
+        {
+            CHECK(sort(L, "numbers", n, 10) == LUA_ERRRUN);
+            checkerror(L, "timeout");
+            CHECK(hits == 10);
+            check(L, n, false);
+        }
+        else
+        {
+            CHECK(sort(L, "numbers", n, 10) == LUA_OK);
+            check(L, n, true);
+        }
+
+        // an interrupt that freezes the table stops the sort before its next write
+        if (enabled)
+        {
+            CHECK(sort(L, "numbers", n, 1, Action::Freeze) == LUA_ERRRUN);
+            checkerror(L, "attempt to modify a readonly table");
+            CHECK(lua_getreadonly(L, -1));
+            check(L, n, false);
+        }
+        else
+        {
+            CHECK(sort(L, "numbers", n, 1, Action::Freeze) == LUA_OK);
+            check(L, n, true);
+        }
+
+        // a coroutine that calls table.sort directly can yield in a C function, but the interrupt can't yield inside the sort
+        lua_State* T = lua_newthread(L);
+        lua_pushcfunction(
+            T,
+            [](lua_State* L)
+            {
+                CHECK(lua_isyieldable(L));
+                return 0;
+            },
+            "isyieldable"
+        );
+        CHECK(lua_resume(T, nullptr, 0) == LUA_OK);
+        lua_pop(L, 1);
+
+        if (enabled)
+        {
+            CHECK(sortthread(L, "numbers", n, 1, Action::Yield) == LUA_ERRRUN);
+            checkerror(L, "attempt to yield across metamethod/C-call boundary");
+            check(L, n, false);
+        }
+        else
+        {
+            CHECK(sortthread(L, "numbers", n, 1, Action::Yield) == LUA_OK);
+            check(L, n, true);
+        }
+
+        // the last interrupt of this sort comes from heap sort; an error or a yield there leaves the table partly sorted too
+        CHECK(sort(L, "killer", 10'000, 0) == LUA_OK);
+        int killerhits = hits;
+        if (enabled)
+            CHECK(killerhits > 10'000 / 256);
+        else
+            CHECK(killerhits == 0);
+        check(L, 10'000, true);
+
+        if (enabled)
+        {
+            CHECK(sort(L, "killer", 10'000, killerhits) == LUA_ERRRUN);
+            checkerror(L, "timeout");
+            check(L, 10'000, false);
+
+            CHECK(sortthread(L, "killer", 10'000, killerhits, Action::Yield) == LUA_ERRRUN);
+            checkerror(L, "attempt to yield across metamethod/C-call boundary");
+            check(L, 10'000, false);
+        }
+
+        // __lt metamethods run bytecode, so they reach the interrupt either way
+        CHECK(sort(L, "objects", 10'000, 0) == LUA_OK);
+        CHECK(hits > 0);
+        check(L, 10'000, true);
+
+        CHECK(sort(L, "objects", 10'000, 100) == LUA_ERRRUN);
+        checkerror(L, "timeout");
+        check(L, 10'000, false);
+
+        // with a comparator, the sort reaches the interrupt through the comparator only
+        CHECK(sort(L, "numbers", 10'000, 0, Action::Error, "rawlessthan") == LUA_OK);
+        comparatorhits[enabled] = hits;
+        check(L, 10'000, true);
+
+        // a comparator or an __lt written in C runs no bytecode; the flag makes the sort call the interrupt after each call
+        CHECK(sort(L, "numbers", 1000, 0, Action::Error, "rawequal") == LUA_OK);
+        CHECK((enabled ? hits >= 1000 : hits == 0));
+        check(L, 1000, false);
+
+        CHECK(sort(L, "cobjects", 1000, 0) == LUA_OK);
+        CHECK((enabled ? hits >= 1000 : hits == 0));
+        check(L, 1000, false);
+
+        if (enabled)
+        {
+            CHECK(sort(L, "cobjects", 1000, 10) == LUA_ERRRUN);
+            checkerror(L, "timeout");
+            check(L, 1000, false);
+        }
+
+        // comparisons of long strings are charged by the bytes they compare: 256 KiB each here
+        CHECK(sort(L, "longstrings", 100, 0) == LUA_OK);
+        CHECK((enabled ? hits >= 100 : hits == 0));
+        check(L, 100, true);
+
+        if (enabled)
+        {
+            CHECK(sort(L, "longstrings", 100, 50) == LUA_ERRRUN);
+            checkerror(L, "timeout");
+            check(L, 100, false);
+        }
+
+        CHECK(sort(L, "killerstrings", 2000, 0) == LUA_OK);
+        CHECK((enabled ? hits > 0 : hits == 0));
+        check(L, 2000, true);
+
+        // a comparator or an __lt that freezes the table stops the sort before its next write
+        for (const char* comparator : {"freezingless", static_cast<const char*>(nullptr)})
+        {
+            int status = sort(L, comparator ? "numbers" : "freezers", 1000, 0, Action::Error, comparator);
+            if (enabled)
+            {
+                CHECK(status == LUA_ERRRUN);
+                checkerror(L, "attempt to modify a readonly table");
+            }
+            else
+            {
+                CHECK(status == LUA_OK);
+            }
+            CHECK(lua_getreadonly(L, -1));
+            check(L, 1000, !enabled);
+        }
+
+        // the sort is still usable after the errors above
+        CHECK(lua_gettop(L) == 0);
+        CHECK(sort(L, "numbers", n, 0) == LUA_OK);
+        check(L, n, true);
+    }
+
+    CHECK(comparatorhits[0] > 0);
+    CHECK(comparatorhits[0] == comparatorhits[1]);
 }
 
 TEST_CASE("UserdataApi")
