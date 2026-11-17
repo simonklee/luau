@@ -26,6 +26,10 @@
 #include "BufferCage.h"
 #include "ConformanceIrHooks.h"
 
+#include "lgc.h"
+#include "lstate.h"
+
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -84,6 +88,7 @@ LUAU_DYNAMIC_FASTFLAG(LuauTableFindInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableMoveBudget)
 LUAU_DYNAMIC_FASTFLAG(LuauTableForeachInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableFindImprovement)
+LUAU_DYNAMIC_FASTFLAG(LuauGcGoalByHeap)
 LUAU_FASTFLAG(LuauPcallErrorContinuationReentry)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
 LUAU_FASTFLAG(LuauExperimentalIfLocalSyntax)
@@ -3605,6 +3610,474 @@ TEST_CASE("ApiAllocationRateAfterFullGC")
     }
 
     CHECK(lua_allocationrate(L) > 0);
+}
+
+// the goal (125% or 200%) a heap goal was computed with, from the heap size it was computed from; 0 if neither
+static int gcGoalOf(size_t heapgoal, size_t heap)
+{
+    for (int goal : {125, 200})
+        if (heapgoal == luaC_heapgoal(heap, goal))
+            return goal;
+
+    return 0;
+}
+
+struct GcProbe
+{
+    int goal;    // the goal the full collection used
+    bool paused; // the collector is still paused after a little garbage
+};
+
+// a full collection, then a little garbage: the collection sets the next trigger from the goal, so at G=200% there is
+// room left and the collector stays paused, and at G=125% there is none
+static GcProbe gcProbeCollect(lua_State* L)
+{
+    global_State* g = L->global;
+
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    int goal = gcGoalOf(g->gcstats.heapgoalsizebytes, g->totalbytes);
+
+    for (int i = 0; i < 16; i++)
+    {
+        lua_newuserdata(L, 1000);
+        lua_pop(L, 1);
+    }
+
+    return {goal, lua_gc(L, LUA_GCISPAUSED, 0) != 0};
+}
+
+// one incremental cycle driven by explicit steps from a paused collector; the goal it ended with
+static int gcGoalAfterCycle(lua_State* L)
+{
+    global_State* g = L->global;
+
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    while (lua_gc(L, LUA_GCSTEP, 1) == 0)
+    {
+    }
+
+    return gcGoalOf(g->gcstats.heapgoalsizebytes, g->gcstats.endtotalsizebytes);
+}
+
+TEST_CASE("ApiGcGoalByHeap")
+{
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauGcGoalByHeap{DFFlag::LuauGcGoalByHeap, enabled};
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+        global_State* g = L->global;
+
+        // ~1 MB of live data
+        lua_createtable(L, 1000, 0);
+        for (int i = 1; i <= 1000; i++)
+        {
+            lua_newuserdata(L, 1000);
+            lua_rawseti(L, -2, i);
+        }
+
+        CHECK(lua_gc(L, LUA_GCCOUNT, 0) > 1000);
+
+        GcProbe p = gcProbeCollect(L);
+        CHECK(p.goal == 200);
+        CHECK(p.paused);
+        CHECK(gcGoalAfterCycle(L) == 200);
+
+        // the probes tell the two goals apart
+        CHECK(lua_gc(L, LUA_GCSETGOAL, 125) == 200);
+        p = gcProbeCollect(L);
+        CHECK(p.goal == 125);
+        CHECK(!p.paused);
+        CHECK(gcGoalAfterCycle(L) == 125);
+        CHECK(lua_gc(L, LUA_GCSETGOAL, 200) == 125);
+
+        // the large goal is unused until a threshold is set
+        CHECK(lua_gc(L, LUA_GCSETGOALLARGE, 125) == 200);
+        p = gcProbeCollect(L);
+        CHECK(p.goal == 200);
+        CHECK(p.paused);
+        CHECK(gcGoalAfterCycle(L) == 200);
+
+        // the heap is past the threshold: the large goal is used when the flag is on
+        int expected = enabled ? 125 : 200;
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, 512) == 0);
+        p = gcProbeCollect(L);
+        CHECK(p.goal == expected);
+        CHECK(p.paused == !enabled);
+        CHECK(gcGoalAfterCycle(L) == expected);
+
+        // the heap is under the threshold
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, 4096) == 512);
+        p = gcProbeCollect(L);
+        CHECK(p.goal == 200);
+        CHECK(p.paused);
+        CHECK(gcGoalAfterCycle(L) == 200);
+
+        // under the threshold, but 200% of the heap passes 125% of a heap at the threshold: the heap goal is capped there,
+        // and the trigger after a full collection moves down by as much
+        int below = lua_gc(L, LUA_GCCOUNT, 0) * 13 / 10;
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, below) == 4096);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        size_t cap = luaC_heapgoal(size_t(below) << 10, 125);
+        size_t uncapped = luaC_heapgoal(g->totalbytes, 200);
+        size_t trigger = luaC_fullgcthreshold(g->totalbytes, 200, 200);
+        CHECK(cap < uncapped);
+        CHECK(g->gcstats.heapgoalsizebytes == (enabled ? cap : uncapped));
+        CHECK(g->GCthreshold == (enabled ? cap - g->totalbytes / 2 : trigger));
+        CHECK(g->GCthreshold > g->totalbytes);
+        while (lua_gc(L, LUA_GCSTEP, 1) == 0)
+        {
+        }
+        CHECK(g->gcstats.heapgoalsizebytes == (enabled ? cap : luaC_heapgoal(g->gcstats.endtotalsizebytes, 200)));
+
+        // past the threshold, the large step multiplier sets the pace: at GL=150%, the trigger after a full collection is
+        // the heap at SL=200% and 1.25 times the heap at SL=400%
+        CHECK(lua_gc(L, LUA_GCSETGOALLARGE, 150) == 125);
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, 512) == below);
+        CHECK(lua_gc(L, LUA_GCSETSTEPMULLARGE, 200) == 200);
+        CHECK(gcProbeCollect(L).paused == !enabled);
+        CHECK(lua_gc(L, LUA_GCSETSTEPMULLARGE, 400) == 200);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        CHECK(g->GCthreshold == luaC_fullgcthreshold(g->totalbytes, enabled ? 150 : 200, enabled ? 400 : 200));
+        CHECK(gcProbeCollect(L).paused);
+        CHECK(lua_gc(L, LUA_GCSETSTEPMULLARGE, 200) == 400);
+        CHECK(lua_gc(L, LUA_GCSETGOALLARGE, 125) == 150);
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, 4096) == 512);
+
+        // unset again; every positive threshold reads back as set
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, 0) == 4096);
+        CHECK(gcProbeCollect(L).goal == 200);
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, -1) == 0);
+        CHECK(gcProbeCollect(L).goal == 200);
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, INT_MAX) == 0);
+        CHECK(gcProbeCollect(L).goal == 200);
+        CHECK(lua_gc(L, LUA_GCSETGOALTHRESHOLD, 0) == INT_MAX);
+        CHECK(lua_gc(L, LUA_GCSETGOALLARGE, 200) == 125);
+    }
+}
+
+TEST_CASE("GcGoalArithmetic")
+{
+    const bool wide = sizeof(size_t) >= sizeof(int64_t);
+
+    // the heap goal: as (heap / 100) * goal where that fits
+    CHECK(luaC_heapgoal(1000, 200) == 2000);
+    CHECK(luaC_heapgoal(20 << 20, 125) == 26214375);
+    CHECK(luaC_heapgoal(1000, 0) == 0);
+    CHECK(luaC_heapgoal(1000, -5) == 0);
+    CHECK(luaC_heapgoal(1000, INT_MIN) == 0);
+    CHECK(luaC_heapgoal(1000, INT_MAX) == (wide ? size_t(21474836470ull) : SIZE_MAX - 1));
+
+    // a goal past what size_t holds saturates below SIZE_MAX (a stopped collector)
+    CHECK(luaC_heapgoal(size_t(1536) << 20, 300) == (wide ? size_t(4831838100ull) : SIZE_MAX - 1));
+    const size_t limit = wide ? size_t(INT64_MAX / 2) : SIZE_MAX - 1;
+    CHECK(luaC_heapgoal(SIZE_MAX, INT_MAX) == limit);
+    CHECK(luaC_heapgoal(uint64_t(INT_MAX) << 10, 1) == (wide ? size_t(21990232545ull) : SIZE_MAX - 1)); // past 32 bits
+
+    // the trigger after a full collection: heap * (G * S / 100 - 100) / S, never below the heap
+    CHECK(luaC_fullgcthreshold(1000, 200, 200) == 1500);
+    CHECK(luaC_fullgcthreshold(1000, 125, 200) == 1000);
+    CHECK(luaC_fullgcthreshold(20 << 20, 175, 200) == 25 << 20); // 20 MiB * 250 overflows 32 bits
+    CHECK(luaC_fullgcthreshold(1000, 0, 200) == 1000);
+    CHECK(luaC_fullgcthreshold(1000, -100, 200) == 1000);
+    CHECK(luaC_fullgcthreshold(1000, INT_MIN, 200) == 1000);
+    CHECK(luaC_fullgcthreshold(1000, 200, 0) == 1000);
+    CHECK(luaC_fullgcthreshold(1000, 200, -200) == 1000);
+    CHECK(luaC_fullgcthreshold(1000, INT_MAX, 200) == (wide ? size_t(21474835970ull) : SIZE_MAX - 1));
+    CHECK(luaC_fullgcthreshold(1000, INT_MAX, INT_MAX) == (wide ? size_t(21474836469ull) : SIZE_MAX - 1));
+    CHECK(luaC_fullgcthreshold(SIZE_MAX / 2, INT_MAX, INT_MAX) == limit);
+}
+
+// a fresh state with ~10 KB of live data, the large goal and step multiplier set, and the threshold at 1 KB
+static StateRef gcBoundaryState(int goal, int stepmul)
+{
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+
+    lua_gc(L, LUA_GCSETGOALLARGE, goal);
+    lua_gc(L, LUA_GCSETSTEPMULLARGE, stepmul);
+    lua_gc(L, LUA_GCSETGOALTHRESHOLD, 1);
+
+    lua_createtable(L, 100, 0);
+    for (int i = 1; i <= 100; i++)
+    {
+        lua_newuserdata(L, 100);
+        lua_rawseti(L, -2, i);
+    }
+
+    return globalState;
+}
+
+// incremental cycles driven by explicit steps, and allocations that step the collector on their own
+static void gcRunCycles(lua_State* L, int cycles)
+{
+    for (int i = 0; i < cycles; i++)
+    {
+        while (lua_gc(L, LUA_GCSTEP, 1) == 0)
+        {
+        }
+
+        CHECK(lua_gc(L, LUA_GCISRUNNING, 0) == 1);
+
+        for (int j = 0; j < 1000; j++)
+        {
+            lua_newuserdata(L, 100);
+            lua_pop(L, 1);
+        }
+    }
+}
+
+TEST_CASE("ApiGcGoalByHeapBoundaries")
+{
+    ScopedFastFlag luauGcGoalByHeap{DFFlag::LuauGcGoalByHeap, true};
+
+    // the large goal is kept within [0%, 1000%], and the step multiplier within [1%, 10000%]
+    for (int goal : {INT_MAX, 1001, 1000, 101, 100, 1, 0, -1, INT_MIN})
+    {
+        StateRef globalState = gcBoundaryState(goal, 200);
+        lua_State* L = globalState.get();
+        global_State* g = L->global;
+        int kept = std::min(std::max(goal, 0), 1000);
+
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        CHECK(g->gcstats.heapgoalsizebytes == luaC_heapgoal(g->totalbytes, kept));
+        CHECK(g->GCthreshold == luaC_fullgcthreshold(g->totalbytes, kept, 200));
+
+        gcRunCycles(L, 8);
+        CHECK(lua_gc(L, LUA_GCSETGOALLARGE, 200) == kept);
+    }
+
+    for (int stepmul : {INT_MAX, 10001, 10000, 1024, 100, 1, 0, -1, INT_MIN})
+    {
+        StateRef globalState = gcBoundaryState(125, stepmul);
+        lua_State* L = globalState.get();
+        global_State* g = L->global;
+        int kept = std::min(std::max(stepmul, 1), 10000);
+
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        CHECK(g->GCthreshold == luaC_fullgcthreshold(g->totalbytes, 125, kept));
+
+        gcRunCycles(L, 8);
+        CHECK(lua_gc(L, LUA_GCSETSTEPMULLARGE, 200) == kept);
+    }
+
+    // a step budget of exactly 2^32 bytes before the division by 100 (4096 KB at 1024%): on 32 bits, it must not wrap
+    // to 0, which would leave the explicit step loop with no progress
+    {
+        StateRef globalState = gcBoundaryState(125, 1024);
+        lua_State* L = globalState.get();
+
+        lua_gc(L, LUA_GCSETSTEPSIZE, 4096);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        gcRunCycles(L, 4);
+    }
+
+    // a capped heap goal from an extreme base goal: the trigger after a full collection stays between the heap and the
+    // heap goal, also for a heap that isn't a multiple of 100 bytes
+    {
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+        global_State* g = L->global;
+
+        lua_gc(L, LUA_GCSETGOAL, INT_MAX);
+        lua_gc(L, LUA_GCSETGOALLARGE, 115);
+        lua_gc(L, LUA_GCSETGOALTHRESHOLD, 8 * 1024);
+
+        lua_createtable(L, 1000, 0);
+        for (int i = 1; i <= 1000; i++)
+        {
+            lua_newuserdata(L, 1000 + i % 7);
+            lua_rawseti(L, -2, i);
+        }
+
+        for (int extra = 1; extra <= 3; extra++)
+        {
+            lua_newuserdata(L, extra);
+            lua_rawseti(L, -2, 1000 + extra);
+
+            lua_gc(L, LUA_GCCOLLECT, 0);
+            size_t heap = g->totalbytes;
+            size_t cap = luaC_heapgoal(size_t(8) << 20, 115);
+
+            CHECK(g->gcstats.heapgoalsizebytes == cap);
+            CHECK(g->GCthreshold >= heap);
+            CHECK(g->GCthreshold <= std::max(heap, cap));
+        }
+    }
+}
+
+struct CappedAlloc
+{
+    size_t used = 0;
+    size_t limit = 0;
+};
+
+static void* cappedRealloc(void* ud, void* ptr, size_t osize, size_t nsize)
+{
+    CappedAlloc* alloc = (CappedAlloc*)ud;
+
+    if (nsize == 0)
+    {
+        free(ptr);
+        alloc->used -= osize;
+        return nullptr;
+    }
+
+    if (alloc->used - osize + nsize > alloc->limit)
+        return nullptr;
+
+    void* result = realloc(ptr, nsize);
+    if (result)
+        alloc->used = alloc->used - osize + nsize;
+
+    return result;
+}
+
+// what the pacer chose at the end of each incremental cycle
+struct GcCycleLog
+{
+    int small = 0; // cycles that ended under the threshold
+    int large = 0; // cycles that ended at or past the threshold
+    int wrong = 0; // cycles whose heap goal was not the expected one
+};
+
+static GcCycleLog gcCycleLog;
+
+// the client's settings: 200% under 8 MB of heap; from 8 MB, 115% and a step multiplier of 1600%
+static void gcSetByHeap(lua_State* L)
+{
+    lua_gc(L, LUA_GCSETGOALLARGE, 115);
+    lua_gc(L, LUA_GCSETSTEPMULLARGE, 1600);
+    lua_gc(L, LUA_GCSETGOALTHRESHOLD, 8 * 1024);
+}
+
+static void gcCycleInterrupt(lua_State* L, int gc)
+{
+    global_State* g = L->global;
+
+    // at the end of a GC step, gc is the state before the step: a cycle ended in this step
+    if (gc <= 0 || g->gcstate != GCSpause)
+        return;
+
+    // with the flag on: 115% from 8 MB, and below, 200% capped at 115% of 8 MB
+    size_t heap = g->gcstats.endtotalsizebytes;
+    bool large = heap >= (size_t(8) << 20);
+    size_t expected = luaC_heapgoal(heap, 200);
+
+    if (DFFlag::LuauGcGoalByHeap)
+        expected = large ? luaC_heapgoal(heap, 115) : std::min(expected, luaC_heapgoal(size_t(8) << 20, 115));
+
+    (large ? gcCycleLog.large : gcCycleLog.small)++;
+    if (g->gcstats.heapgoalsizebytes != expected)
+        gcCycleLog.wrong++;
+}
+
+// runs source in a fresh VM under a 32 MB memory limit with the client's settings, for both flag values. every
+// incremental cycle must end with the heap goal the policy selects (checked by the interrupt). with the flag on and
+// 64-bit pointers, the call must also complete and leave at least liveMB of live data; with the flag off, whether the
+// call runs out of memory depends on the pacer's timing, so it is not checked
+static void runGcGoalByHeapCap(const char* source, size_t liveMB)
+{
+    size_t bytecodeSize = 0;
+    char* bytecode = luau_compile(source, strlen(source), nullptr, &bytecodeSize);
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauGcGoalByHeap{DFFlag::LuauGcGoalByHeap, enabled};
+
+        CappedAlloc alloc;
+        alloc.limit = 32 << 20;
+
+        StateRef globalState(lua_newstate(cappedRealloc, &alloc), lua_close);
+        lua_State* L = globalState.get();
+        luaL_openlibs(L);
+        gcSetByHeap(L);
+
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        size_t base = L->global->totalbytes;
+
+        gcCycleLog = GcCycleLog();
+        lua_callbacks(L)->interrupt = gcCycleInterrupt;
+
+        REQUIRE(luau_load(L, "=GcGoalByHeapCap", bytecode, bytecodeSize, 0) == 0);
+        int status = lua_pcall(L, 0, 1, 0);
+
+        lua_callbacks(L)->interrupt = nullptr;
+
+        CHECK(gcCycleLog.small > 0);
+        CHECK(gcCycleLog.wrong == 0);
+
+        // the piece counts are sized for 64-bit layouts, the client's: elsewhere the same sources hold less data
+        if (enabled && sizeof(void*) == 8)
+        {
+            if (status != LUA_OK)
+                FAIL(std::string(lua_tostring(L, -1)));
+
+            lua_gc(L, LUA_GCCOLLECT, 0);
+            CHECK(L->global->totalbytes - base >= (liveMB << 20));
+
+            if (liveMB >= 8)
+                CHECK(gcCycleLog.large > 0);
+        }
+    }
+
+    free(bytecode);
+}
+
+TEST_CASE("GcGoalByHeapEffectiveCap")
+{
+    // 23 MB of live data of each shape, built while making garbage (about 80,000 small tables per MB), then 500,000
+    // more small tables; under a 32 MB limit, at 200% the heap needs about twice the live data. what the collector marks
+    // differs: nothing in a long string, every slot of a table, and a short string is a small object of its own
+    const char* shapes[][3] = {
+        {"string.rep('x', 65536 - 64) .. i", "372", "5000"},
+        {"table.create(256, i)", "5900", "312"},
+        {"{ type = 'span', text = i, fg = 'red', bold = true }", "127000", "16"},
+        {"string.format('%080d', i)", "183000", "8"},
+    };
+
+    for (auto& shape : shapes)
+    {
+        INFO(std::string(shape[0]));
+
+        char source[512];
+        snprintf(
+            source,
+            sizeof(source),
+            "local function make(i) return %s end\n"
+            "local live = table.create(%s)\n"
+            "for i = 1, %s do\n"
+            "    live[i] = make(i)\n"
+            "    for j = 1, %s do local t = { j } end\n"
+            "end\n"
+            "for i = 1, 500000 do local t = { i } end\n"
+            "return live\n",
+            shape[0],
+            shape[1],
+            shape[1],
+            shape[2]
+        );
+
+        runGcGoalByHeapCap(source, 23);
+    }
+}
+
+TEST_CASE("GcGoalByHeapCliff")
+{
+    // a heap that settles under 8 MB, garbage the collector waits for, then a gsub of a 5 MB string (carbon's case): with
+    // 200% under 8 MB uncapped, the collector waits until about 15 MB of heap and the gsub may run out of memory
+    runGcGoalByHeapCap(
+        R"(
+        local s = string.rep("a", 5 * 1048576)
+        for k = 1, 200000 do local t = { k } end
+        for k = 1, 80000 do local t = { k } end
+        local s2 = string.gsub(s, "a", "b")
+        assert(#s2 == #s)
+        return s
+    )",
+        5
+    );
 }
 
 TEST_CASE("ApiEncode")
