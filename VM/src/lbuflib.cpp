@@ -282,7 +282,8 @@ static int buffer_copy(lua_State* L)
     void* sbuf = luaL_checkbuffer(L, 3, &slen);
     int soffset = luaL_optinteger(L, 4, 0);
 
-    int size = luaL_optinteger(L, 5, int(slen) - soffset);
+    // the default size is formed without subtracting an offset that might be out of range; a negative size is out of bounds below
+    int size = luaL_optinteger(L, 5, unsigned(soffset) <= slen ? int(slen - unsigned(soffset)) : -1);
 
     if (size < 0)
         luaL_error(L, "buffer access out of bounds");
@@ -303,7 +304,7 @@ static int buffer_fill(lua_State* L)
     void* buf = luaL_checkbuffer(L, 1, &len);
     int offset = luaL_checkinteger(L, 2);
     unsigned value = luaL_checkunsigned(L, 3);
-    int size = luaL_optinteger(L, 4, int(len) - offset);
+    int size = luaL_optinteger(L, 4, unsigned(offset) <= len ? int(len - unsigned(offset)) : -1);
 
     if (size < 0)
         luaL_error(L, "buffer access out of bounds");

@@ -913,6 +913,24 @@ end
 boundchecksoutofrange(2^31, -2^31 - 1, 2^32, 2^32 + 1, 1e300, math.huge, -math.huge, 0/0)
 boundchecksoutofrange(2^63, -2^63, 2^64)
 
+-- default sizes of copy and fill with offsets out of range are out of bounds, without overflow
+local function copyfilloutofrange(...)
+  local b = buffer.create(1)
+
+  for _, offset in {...} do
+    assert(ecall(buffer.copy, b, 0, b, offset) == "buffer access out of bounds")
+    assert(ecall(buffer.copy, b, 0, b, offset, 1) == "buffer access out of bounds")
+    assert(ecall(buffer.copy, b, offset, b) == "buffer access out of bounds")
+    assert(ecall(buffer.fill, b, offset, 0) == "buffer access out of bounds")
+    assert(ecall(buffer.fill, b, offset, 0, 1) == "buffer access out of bounds")
+  end
+
+  buffer.copy(b, 0, b, 1)
+  buffer.fill(b, 1, 0)
+end
+
+copyfilloutofrange(-2^31, 2^31, 1e300, 0/0, -1, 2)
+
 local function testslowcalls()
   getfenv()
 
