@@ -13,6 +13,9 @@
 
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableFindImprovement, false)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableSortInterrupt, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableFindInterrupt, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableMoveBudget, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableForeachInterrupt, true)
 
 // calls the interrupt from a library function that runs no bytecode for a while; the interrupt can't yield there
 LUAU_NOINLINE static void tablib_interrupt(lua_State* L)
@@ -27,6 +30,14 @@ LUAU_NOINLINE static void tablib_interrupt(lua_State* L)
     }
 }
 
+// a callback written in C runs no bytecode, and may itself call table.foreach with a C callback, and so on; with
+// LuauTableForeachInterrupt, foreach and foreachi call the interrupt after each call of one
+static void foreach_interrupt(lua_State* L)
+{
+    if (DFFlag::LuauTableForeachInterrupt && clvalue(&L->base[1])->isC)
+        tablib_interrupt(L);
+}
+
 static int foreachi(lua_State* L)
 {
     luaL_checktype(L, 1, LUA_TTABLE);
@@ -39,6 +50,7 @@ static int foreachi(lua_State* L)
         lua_pushinteger(L, i); // 1st argument
         lua_rawgeti(L, 1, i);  // 2nd argument
         lua_call(L, 2, 1);
+        foreach_interrupt(L);
         if (!lua_isnil(L, -1))
             return 1;
         lua_pop(L, 1); // remove nil result
@@ -57,6 +69,7 @@ static int foreach (lua_State* L)
         lua_pushvalue(L, -3); // key
         lua_pushvalue(L, -3); // value
         lua_call(L, 2, 1);
+        foreach_interrupt(L);
         if (!lua_isnil(L, -1))
             return 1;
         lua_pop(L, 2); // remove value and result
@@ -125,6 +138,38 @@ static bool tovalidintkey(lua_State* L, int idx, int f, int e, int* result)
     }
 
     return false;
+}
+
+// with LuauTableMoveBudget, a move that goes element by element calls the interrupt after each this many elements
+const int kMoveInterruptElements = 1024;
+
+// moveelements' element by element move of n elements, with LuauTableMoveBudget; backward moves the last one first
+LUAU_NOINLINE static void movebudget(lua_State* L, int srct, int dstt, LuaTable* dst, int f, int t, int n, bool backward)
+{
+    int step = backward ? -1 : 1;
+    int budget = kMoveInterruptElements;
+
+    for (int k = 0, i = backward ? n - 1 : 0; k < n; ++k, i += step)
+    {
+        if (LUAU_UNLIKELY(budget-- == 0))
+        {
+            budget = kMoveInterruptElements - 1;
+            tablib_interrupt(L);
+
+            // the interrupt may freeze the destination, and the move must not write to it after that
+            if (dst->readonly)
+                luaG_readonlyerror(L);
+        }
+
+        lua_rawgeti(L, srct, f + i);
+
+        // writing nil to an absent key would add a node for it, and a table whose free nodes run out rehashes on each
+        // such write without growing, since nil values don't count towards its size
+        if (ttisnil(L->top - 1) && ttisnil(luaH_getnum(dst, t + i)))
+            L->top--;
+        else
+            lua_rawseti(L, dstt, t + i);
+    }
 }
 
 static void moveelements(lua_State* L, int srct, int dstt, int f, int e, int t, bool sparsemove)
@@ -208,6 +253,10 @@ static void moveelements(lua_State* L, int srct, int dstt, int f, int e, int t, 
         }
 
         lua_pop(L, 1);
+    }
+    else if (DFFlag::LuauTableMoveBudget)
+    {
+        movebudget(L, srct, dstt, dst, f, t, n, /* backward */ !(t > e || t <= f || dst != src));
     }
     else
     {
@@ -765,6 +814,38 @@ static int tcreate(lua_State* L)
     return 1;
 }
 
+// tfind's search with LuauTableFindInterrupt for a value with an __eq metamethod, which may be written in C and run no
+// bytecode, or from an index close enough to INT_MAX for the next one to overflow: calls the interrupt after each
+// comparison that may call __eq, and stops after INT_MAX
+LUAU_NOINLINE static int findguarded(lua_State* L, LuaTable* t, int init)
+{
+    for (int i = init;; ++i)
+    {
+        const TValue* e = luaH_getnum(t, i);
+        if (ttisnil(e))
+            break;
+
+        StkId v = L->base + 1;
+        bool call = ttype(e) == ttype(v);
+        bool found = equalobj(L, v, e);
+
+        if (call)
+            tablib_interrupt(L);
+
+        if (found)
+        {
+            lua_pushinteger(L, i);
+            return 1;
+        }
+
+        if (i == INT_MAX)
+            break;
+    }
+
+    lua_pushnil(L);
+    return 1;
+}
+
 static int tfind(lua_State* L)
 {
     int init = 1;
@@ -811,6 +892,13 @@ static int tfind(lua_State* L)
             return 1;
         }
     }
+
+    // only the value's __eq can be called, and nothing else runs if it has none; then the table doesn't change, and the
+    // search goes through at most as many indices as the table has room for, so the next one can't overflow unless init
+    // is that close to INT_MAX
+    if (DFFlag::LuauTableFindInterrupt && ((iscollectable(L->base + 1) && !ttisnil(luaT_gettmbyobj(L, L->base + 1, TM_EQ))) ||
+                                              init > INT_MAX - t->sizearray - sizenode(t)))
+        return findguarded(L, t, init);
 
     for (int i = init;; ++i)
     {

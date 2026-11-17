@@ -80,6 +80,10 @@ LUAU_DYNAMIC_FASTFLAG(LuauLinearStringSearch)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringGsub)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringSplit)
 LUAU_DYNAMIC_FASTFLAG(LuauTableSortInterrupt)
+LUAU_DYNAMIC_FASTFLAG(LuauTableFindInterrupt)
+LUAU_DYNAMIC_FASTFLAG(LuauTableMoveBudget)
+LUAU_DYNAMIC_FASTFLAG(LuauTableForeachInterrupt)
+LUAU_DYNAMIC_FASTFLAG(LuauTableFindImprovement)
 LUAU_FASTFLAG(LuauPcallErrorContinuationReentry)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
 LUAU_FASTFLAG(LuauExperimentalIfLocalSyntax)
@@ -1468,8 +1472,12 @@ TEST_CASE("Sort")
 
 TEST_CASE("Move")
 {
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTableMoveBudget{DFFlag::LuauTableMoveBudget, enabled};
 
-    runConformance("move.luau");
+        runConformance("move.luau");
+    }
 }
 
 TEST_CASE("Clear")
@@ -4714,6 +4722,375 @@ end
 
     CHECK(comparatorhits[0] > 0);
     CHECK(comparatorhits[0] == comparatorhits[1]);
+}
+
+TEST_CASE("InterruptTableFind")
+{
+    static int hits;
+    static int limit;
+
+    const std::string source = R"(
+local ceq = { __eq = rawequal }
+local leq = { __eq = function(a, b) return rawequal(a, b) end }
+
+-- n distinct objects and another one to search for; rawequal is false for distinct objects
+local function objects(n, mt)
+    local t = table.create(n)
+    for i = 1, n do t[i] = setmetatable({}, mt) end
+    return t, setmetatable({}, mt)
+end
+
+function cobjects(n) return objects(n, ceq) end
+function luauobjects(n) return objects(n, leq) end
+
+-- objects whose C __eq is always true (rawlen returns 0, which is true), so the search ends at the first element
+function matchobjects(n) return objects(n, { __eq = rawlen }) end
+
+-- n numbers, which can't call the object's __eq
+function numbers(n) return table.create(n, 1), setmetatable({}, ceq) end
+)";
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTableFindInterrupt{DFFlag::LuauTableFindInterrupt, enabled};
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+
+        luaL_openlibs(L);
+
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
+        int result = luau_load(L, "=InterruptTableFind", bytecode, bytecodeSize, 0);
+        free(bytecode);
+
+        REQUIRE(result == LUA_OK);
+        REQUIRE(lua_pcall(L, 0, 0, 0) == LUA_OK);
+
+        lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+        {
+            if (gc >= 0)
+                return;
+
+            if (++hits == limit)
+                luaL_error(L, "timeout");
+        };
+
+        // calls table.find from C on what generator(n) returns, so that the interrupt's hits all come from the search; checks
+        // the index it finds, or nil for expected = 0
+        auto find = [](lua_State* L, const char* generator, int n, int stop, int expected = 0)
+        {
+            lua_getglobal(L, "table");
+            lua_getfield(L, -1, "find");
+            lua_remove(L, -2);
+
+            limit = 0; // no stop while the generator runs
+            lua_getglobal(L, generator);
+            lua_pushinteger(L, n);
+            REQUIRE(lua_pcall(L, 1, 2, 0) == LUA_OK);
+
+            hits = 0;
+            limit = stop;
+            int status = lua_pcall(L, 2, 1, 0);
+            if (status == LUA_OK && expected == 0)
+                CHECK(lua_isnil(L, -1));
+            else if (status == LUA_OK)
+                CHECK(lua_tointeger(L, -1) == expected);
+            lua_pop(L, 1);
+            return status;
+        };
+
+        // the search calls the interrupt after each call of a C __eq, and only with the flag
+        CHECK(find(L, "cobjects", 1000, 0) == LUA_OK);
+        CHECK(hits == (enabled ? 1000 : 0));
+
+        CHECK(find(L, "numbers", 1000, 0) == LUA_OK);
+        CHECK(hits == 0);
+
+        if (enabled)
+        {
+            CHECK(find(L, "cobjects", 1000, 10) == LUA_ERRRUN);
+            CHECK(hits == 10);
+        }
+
+        // the comparison that finds the value is charged too
+        CHECK(find(L, "matchobjects", 1000, 0, 1) == LUA_OK);
+        CHECK(hits == (enabled ? 1 : 0));
+
+        CHECK(find(L, "matchobjects", 1000, 1, 1) == (enabled ? LUA_ERRRUN : LUA_OK));
+
+        // an __eq written in Luau reaches the interrupt either way
+        CHECK(find(L, "luauobjects", 1000, 0) == LUA_OK);
+        CHECK(hits >= 1000);
+    }
+}
+
+TEST_CASE("TableFindIntMax")
+{
+    const std::string source = R"(
+local mt = { __eq = rawequal }
+local a, b = setmetatable({}, mt), setmetatable({}, mt)
+
+-- the search stops at the largest index rather than going on at the smallest
+assert(table.find({ [2147483647] = a, [-2147483648] = b }, b, 2147483647) == nil)
+assert(table.find({ [2147483647] = 1, [-2147483648] = 2 }, 2, 2147483647) == nil)
+assert(table.find({ [2147483647] = 1, [-2147483648] = 2 }, 1, 2147483647) == 2147483647)
+assert(table.find({ [2147483647] = a }, a, 2147483647) == 2147483647)
+)";
+
+    // without LuauTableFindInterrupt, the search is the same as before, and the next index after INT_MAX overflows
+    ScopedFastFlag luauTableFindInterrupt{DFFlag::LuauTableFindInterrupt, true};
+
+    for (bool improvement : {false, true})
+    {
+        ScopedFastFlag luauTableFindImprovement{DFFlag::LuauTableFindImprovement, improvement};
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+
+        luaL_openlibs(L);
+
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
+        int result = luau_load(L, "=TableFindIntMax", bytecode, bytecodeSize, 0);
+        free(bytecode);
+
+        REQUIRE(result == LUA_OK);
+        CHECK(lua_pcall(L, 0, 0, 0) == LUA_OK);
+    }
+}
+
+TEST_CASE("InterruptTableForeach")
+{
+    static int hits;
+    static int limit;
+
+    const std::string source = R"(
+-- a binary tree of depth 12 shared at each level, whose leaves map to getmetatable; table.foreach(tree, table.foreach)
+-- calls table.foreach and getmetatable for each of its 2^12 paths, all in C
+local leaf1, leaf2 = { 1 }, { 1 }
+tree = { [leaf1] = getmetatable, [leaf2] = getmetatable }
+local other = { [leaf1] = getmetatable, [leaf2] = getmetatable }
+for d = 1, 11 do
+    tree, other = { [tree] = table.foreach, [other] = table.foreach }, { [tree] = table.foreach, [other] = table.foreach }
+end
+
+pair = { table.foreach, tree }
+
+array = table.create(1000, 1)
+)";
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTableForeachInterrupt{DFFlag::LuauTableForeachInterrupt, enabled};
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+
+        luaL_openlibs(L);
+
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
+        int result = luau_load(L, "=InterruptTableForeach", bytecode, bytecodeSize, 0);
+        free(bytecode);
+
+        REQUIRE(result == LUA_OK);
+        REQUIRE(lua_pcall(L, 0, 0, 0) == LUA_OK);
+
+        lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+        {
+            if (gc >= 0)
+                return;
+
+            if (++hits == limit)
+                luaL_error(L, "timeout");
+        };
+
+        // calls library.function(global, callback) from C, so that the interrupt's hits all come from the call
+        auto call = [](lua_State* L, const char* library, const char* function, const char* global, const char* callback, int stop)
+        {
+            lua_getglobal(L, library);
+            lua_getfield(L, -1, function);
+            lua_remove(L, -2);
+            lua_getglobal(L, global);
+            lua_getglobal(L, callback == nullptr ? "table" : "_G");
+            lua_getfield(L, -1, callback == nullptr ? "foreach" : callback);
+            lua_remove(L, -2);
+
+            hits = 0;
+            limit = stop;
+            int status = lua_pcall(L, 2, 0, 0);
+            if (status != LUA_OK)
+                lua_pop(L, 1);
+            return status;
+        };
+
+        // table.foreach(tree, table.foreach), directly and as the comparator of a sort of two elements
+        CHECK(call(L, "table", "foreach", "tree", nullptr, 0) == LUA_OK);
+        CHECK(hits == (enabled ? 3 * 4096 - 2 : 0)); // calls of table.foreach below the top and on the leaves, and of getmetatable
+
+        CHECK(call(L, "table", "sort", "pair", nullptr, 0) == LUA_OK);
+        CHECK((enabled ? hits >= 4096 : hits <= 1)); // the sort calls it once, after its C comparator returns
+
+        if (enabled)
+        {
+            CHECK(call(L, "table", "foreach", "tree", nullptr, 100) == LUA_ERRRUN);
+            CHECK(call(L, "table", "sort", "pair", nullptr, 100) == LUA_ERRRUN);
+        }
+
+        // table.foreachi(array, getmetatable) calls a C function for each element
+        CHECK(call(L, "table", "foreachi", "array", "getmetatable", 0) == LUA_OK);
+        CHECK(hits == (enabled ? 1000 : 0));
+    }
+}
+
+TEST_CASE("TableMoveNil")
+{
+    static size_t allocations;
+
+    const std::string source = R"(
+-- a table with 2^k - 1 hash keys, so that one free node is left
+local t = {}
+for i = 1, 1023 do t[-i] = i end
+
+-- moves absent elements, which are nil, to absent keys
+function move()
+    table.move(t, 1, 2048, 2^29, t)
+
+    local count = 0
+    for k in t do count += 1 end
+    return count
+end
+)";
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTableMoveBudget{DFFlag::LuauTableMoveBudget, enabled};
+
+        StateRef globalState(
+            lua_newstate(
+                [](void* ud, void* ptr, size_t osize, size_t nsize) -> void*
+                {
+                    if (nsize == 0)
+                    {
+                        free(ptr);
+                        return nullptr;
+                    }
+
+                    allocations++;
+                    return realloc(ptr, nsize);
+                },
+                nullptr
+            ),
+            lua_close
+        );
+        lua_State* L = globalState.get();
+
+        luaL_openlibs(L);
+
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
+        int result = luau_load(L, "=TableMoveNil", bytecode, bytecodeSize, 0);
+        free(bytecode);
+
+        REQUIRE(result == LUA_OK);
+        REQUIRE(lua_pcall(L, 0, 0, 0) == LUA_OK);
+
+        lua_getglobal(L, "move");
+        allocations = 0;
+        REQUIRE(lua_pcall(L, 0, 1, 0) == LUA_OK);
+
+        // the move adds no keys either way, but without the flag, each nil write rehashes the table
+        CHECK(lua_tointeger(L, -1) == 1023);
+        if (enabled)
+            CHECK(allocations < 10);
+        else
+            CHECK(allocations >= 1024);
+        lua_pop(L, 1);
+    }
+}
+
+TEST_CASE("InterruptTableMove")
+{
+    static int hits;
+    static bool freeze;
+
+    const std::string source = R"(
+-- 2048 hash keys and a move of 4096 elements, which is too few for the sparse path, so the move goes element by element
+src = {}
+for i = 1, 2048 do src[-i] = i end
+for i = 1, 4096, 2 do src[i] = i end
+)";
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTableMoveBudget{DFFlag::LuauTableMoveBudget, enabled};
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+
+        luaL_openlibs(L);
+
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
+        int result = luau_load(L, "=InterruptTableMove", bytecode, bytecodeSize, 0);
+        free(bytecode);
+
+        REQUIRE(result == LUA_OK);
+        REQUIRE(lua_pcall(L, 0, 0, 0) == LUA_OK);
+
+        lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+        {
+            if (gc >= 0)
+                return;
+
+            hits++;
+
+            if (freeze)
+                lua_setreadonly(L, 5, true); // the destination
+        };
+
+        // table.move(src, 1, 4096, 1000001, dst) called from C, so that the interrupt's hits all come from the move; leaves
+        // dst on the stack, below the error if there is one
+        auto move = [](lua_State* L)
+        {
+            lua_newtable(L);
+            lua_getglobal(L, "table");
+            lua_getfield(L, -1, "move");
+            lua_remove(L, -2);
+            lua_getglobal(L, "src");
+            lua_pushinteger(L, 1);
+            lua_pushinteger(L, 4096);
+            lua_pushinteger(L, 1000001);
+            lua_pushvalue(L, -6);
+
+            hits = 0;
+            return lua_pcall(L, 5, 0, 0);
+        };
+
+        freeze = false;
+        CHECK(move(L) == LUA_OK);
+        CHECK(hits == (enabled ? 3 : 0)); // after each 1024 elements, apart from the last ones
+        lua_rawgeti(L, -1, 1000003);
+        CHECK(lua_tointeger(L, -1) == 3);
+        lua_settop(L, 0);
+
+        // an interrupt that freezes the destination stops the move before its next write
+        freeze = true;
+        if (enabled)
+        {
+            CHECK(move(L) == LUA_ERRRUN);
+            CHECK(strcmp(lua_tostring(L, -1), "attempt to modify a readonly table") == 0);
+            lua_pop(L, 1);
+            lua_rawgeti(L, -1, 1000000 + 4095);
+            CHECK(lua_isnil(L, -1)); // the move stopped before it got there
+        }
+        else
+        {
+            CHECK(move(L) == LUA_OK);
+        }
+        lua_settop(L, 0);
+    }
 }
 
 TEST_CASE("UserdataApi")
