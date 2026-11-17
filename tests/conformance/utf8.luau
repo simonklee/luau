@@ -234,4 +234,24 @@ for p, c in string.gmatch(x, "()(" .. utf8.charpattern .. ")") do
   end
 end
 
+-- a lead byte with more than 3 continuation bytes is invalid
+do
+  local function id(x) return x end
+
+  local ok, pos = utf8.len("\xFF\x80\x80\x80\x80\x80\x80\x80")
+  assert(ok == nil and pos == 1)
+  ok, pos = utf8.len("a\xF8\x88\x80\x80\x80")
+  assert(ok == nil and pos == 2)
+  assert(not pcall(utf8.codepoint, "\xFF\x80\x80\x80\x80\x80\x80\x80"))
+  assert(not pcall(function() for _ in utf8.codes("\xFF\x80\x80\x80\x80\x80\x80\x80") do end end))
+
+  -- the iterator of codes ends at positions that convert to the bottom of the int range
+  local nextcode = utf8.codes("abc")
+  for _, v in {id(-2^31), id(2^31), id(1e300), id(0/0)} do
+    assert(select("#", nextcode("abc", v)) == 0)
+  end
+  local p, c = nextcode("abc", id(-2^31 + 1))
+  assert(p == 1 and c == 97)
+end
+
 return 'OK'

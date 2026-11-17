@@ -1158,6 +1158,22 @@ do
   assert(not pcall(table.create, nan))
   assert(not pcall(function() return table.create(id(2^31)) end))
   assert(not pcall(function() return table.create(nan) end))
+
+  -- indices at the bottom of the int range are out of range, not an overflow
+  -- a single result of select on ... is a fast call
+  local function one(v, ...) return (select(v, ...)) end
+  for _, v in {id(-2^31), id(2^31), nan} do
+    assert(not pcall(select, v, "a", "b"))
+    assert(not pcall(one, v, "a", "b"))
+    local ok, err = pcall(table.concat, {"a", "b"}, ",", v, v)
+    assert(not ok and err:find("at index -2147483648", 1, true))
+  end
+
+  -- ipairs's iterator wraps around at the end of the int range
+  local inext = ipairs({})
+  assert(select("#", inext({}, id(2^31 - 1))) == 0)
+  local i, v = inext({[-2^31] = "x"}, id(2^31 - 1))
+  assert(i == -2^31 and v == "x")
 end
 
 return "OK"
