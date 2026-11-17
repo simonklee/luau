@@ -581,8 +581,14 @@ do
     assert(select("#", table.unpack({1, 2, 3}, 1, v)) == 0)
     assert(not pcall(select, v, "a", "b"))
     assert(string.format("%c", v) == "\0")
+    assert(not pcall(function() return string.char(v) end))
     assert(not pcall(string.pack, "i4", v))
   end
+
+  -- a constant out of range is not folded (at -O2) and raises the same error
+  assert(not pcall(function() return string.char(1e300) end))
+  assert(not pcall(function() return string.char(65, 2^31) end))
+  assert(string.char(65.5) == "A")
 
   -- integers out of the 64-bit range (and NaN) format as the minimum 64-bit integer
   assert(string.format("%d", id(2^31)) == "2147483648")
