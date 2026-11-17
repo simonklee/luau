@@ -114,6 +114,25 @@ do
     assert(os.difftime(v, v) == 0)
     assert(os.date("!%Y", v) == nil)
   end
+
+  -- date fields near the int range wrap around in the date math
+  local function t(y, m, d, h) return os.time({year = id(y), month = id(m), day = id(d), hour = h}) end
+  assert(t(2^31 - 1, 1, 1) == 140486311137600)
+  assert(t(-2^31, 1, 1) == 140486342673600)
+  assert(t(1e300, 1, 1) == 140486342673600)
+  assert(t(2000, 2^31 - 1, 1) == 81059859172800)
+  assert(t(2000, -2^31, 1) == 81059861851200)
+  assert(t(2000, 1, 2^31 - 1) == nil)
+  assert(t(2000, 1, -2^31) == nil)
+  assert(t(2000, 1, 1, 2^31 - 1) == 7731887814000)
+  assert(t(2^31 - 1, 2^31 - 1, 2^31 - 1, 2^31 - 1) == 43733577308400)
+  assert(t(2000, 14, 1) == 981028800)
+  assert(t(2000, -3, 1) == 936187200)
+
+  -- the year of times near the end of the int range of years wraps around as well (where gmtime handles them at all)
+  local hi, lo = os.date("!*t", id(67767976233532799)), os.date("!*t", id(-67768040609740800))
+  assert(hi == nil or hi.year == -2^31)
+  assert(lo == nil or lo.year == -2^31 + 1900)
 end
 
 return 'OK'
