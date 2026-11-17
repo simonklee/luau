@@ -79,6 +79,7 @@ LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
 LUAU_FASTFLAG(LuauGcTraceUdata)
 LUAU_DYNAMIC_FASTFLAG(LuauGcHeapShrinkFix)
 LUAU_DYNAMIC_FASTFLAG(LuauLinearStringSearch)
+LUAU_DYNAMIC_FASTFLAG(LuauPatternBudget)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringGsub)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringSplit)
 LUAU_DYNAMIC_FASTFLAG(LuauTableSortInterrupt)
@@ -2363,7 +2364,7 @@ TEST_CASE("LazyLoad")
           "safeenv.luau",
           "vararg.luau"})
     {
-        INFO(name);
+        INFO(std::string(name));
         runConformance(name);
     }
 }
@@ -4634,8 +4635,303 @@ return f, object
     CHECK(totalFromRegistry + totalFromL == totalHeap);
 }
 
+TEST_CASE("PatternBudget")
+{
+    // results don't change with either value of the flag, on the paths of the other two flags, or with an interrupt
+    // that returns
+    for (bool patternBudget : {false, true})
+    {
+        for (bool optimizeStringGsub : {false, true})
+        {
+            for (bool optimizeStringSplit : {false, true})
+            {
+                ScopedFastFlag luauPatternBudget{DFFlag::LuauPatternBudget, patternBudget};
+                ScopedFastFlag luauOptimizeStringGsub{DFFlag::LuauOptimizeStringGsub, optimizeStringGsub};
+                ScopedFastFlag luauOptimizeStringSplit{DFFlag::LuauOptimizeStringSplit, optimizeStringSplit};
+
+                runConformance("patternbudget.luau");
+                runConformance(
+                    "patternbudget.luau",
+                    [](lua_State* L)
+                    {
+                        lua_callbacks(L)->interrupt = [](lua_State* L, int gc) {};
+                    }
+                );
+            }
+        }
+    }
+}
+
+TEST_CASE("PatternBudgetInterrupt")
+{
+    ScopedFastFlag luauPatternBudget{DFFlag::LuauPatternBudget, true};
+
+    static int calls;
+    static int timeouts;
+
+    StateRef globalState = runConformance("patternbudget.luau");
+    lua_State* L = globalState.get();
+
+    // each worst case runs for seconds or more without the flag, and its pattern function calls the interrupt only at
+    // its start, or never; with it, the 100th call stops it
+    lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+    {
+        if (gc >= 0)
+            return;
+
+        if (++calls == 100)
+        {
+            calls = 0;
+            timeouts++;
+            luaL_error(L, "timeout");
+        }
+    };
+
+    const char* worstcases[] = {
+        "budgetset",
+        "budgetsetmin",
+        "budgetgsub",
+        "budgetmatch",
+        "budgetgmatch",
+        "budgetfind",
+        "budgetgsubtable",
+        "budgetreplacement",
+        "budgetbalance",
+        "budgetbackref",
+        "budgetfrontier",
+    };
+
+    for (bool optimizeStringGsub : {false, true})
+    {
+        ScopedFastFlag luauOptimizeStringGsub{DFFlag::LuauOptimizeStringGsub, optimizeStringGsub};
+
+        for (const char* name : worstcases)
+        {
+            INFO(std::string(name));
+
+            lua_State* T = lua_newthread(L);
+            lua_getglobal(T, name);
+
+            calls = 0;
+            timeouts = 0;
+            int status = lua_resume(T, nullptr, 0);
+
+            // with LuauOptimizeStringGsub, gsub finds the literal pattern with the linear search, and returns
+            if (optimizeStringGsub && strcmp(name, "budgetgsub") == 0)
+            {
+                CHECK(status == LUA_OK);
+                CHECK(timeouts == 0);
+            }
+            else
+            {
+                CHECK(status == LUA_ERRRUN);
+                CHECK(timeouts == 1);
+                CHECK(strstr(lua_tostring(T, -1), "timeout") != nullptr);
+            }
+
+            lua_pop(L, 1);
+        }
+    }
+
+    // the error leaves nothing behind that stops the next pattern call
+    {
+        lua_State* T = lua_newthread(L);
+        lua_getglobal(T, "budgetpcall");
+
+        calls = 0;
+        timeouts = 0;
+        int status = lua_resume(T, nullptr, 0);
+        CHECK(status == LUA_OK);
+        CHECK(timeouts == 10);
+
+        lua_pop(L, 1);
+    }
+
+    // oc-context-grid's count of 4-byte characters in 1 MB: about one interrupt call for each 1000 positions with the
+    // flag (8 units each), instead of one for each position
+    lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+    {
+        if (gc < 0)
+            calls++;
+    };
+
+    for (bool patternBudget : {false, true})
+    {
+        ScopedFastFlag luauPatternBudgetCount{DFFlag::LuauPatternBudget, patternBudget};
+
+        lua_State* T = lua_newthread(L);
+        lua_getglobal(T, "countwide");
+        lua_pushinteger(T, 1 << 20);
+
+        calls = 0;
+        int status = lua_resume(T, nullptr, 1);
+        REQUIRE(status == LUA_OK);
+        CHECK(lua_tointeger(T, -1) == 80660);
+
+        if (patternBudget)
+        {
+            CHECK(calls > 0);
+            CHECK(calls < 2000);
+        }
+        else
+        {
+            CHECK(calls > 1 << 20);
+        }
+
+        lua_pop(L, 1);
+    }
+}
+
+static int patternBudgetCalls = 0;
+
+// calls chargecase(name, n) from patternbudget.luau, then the string function it returns, directly, and returns that
+// function's interrupt calls
+static int callChargeCase(lua_State* L, const char* name, int n)
+{
+    int base = lua_gettop(L);
+    lua_getglobal(L, "chargecase");
+    lua_pushstring(L, name);
+    lua_pushinteger(L, n);
+    REQUIRE(lua_pcall(L, 2, LUA_MULTRET, 0) == LUA_OK);
+
+    lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+    {
+        if (gc < 0)
+            patternBudgetCalls++;
+    };
+
+    patternBudgetCalls = 0;
+    int status = lua_pcall(L, lua_gettop(L) - base - 1, 0, 0);
+    lua_callbacks(L)->interrupt = nullptr;
+    REQUIRE(status == LUA_OK);
+
+    return patternBudgetCalls;
+}
+
+TEST_CASE("PatternBudgetCharges")
+{
+    ScopedFastFlag luauPatternBudget{DFFlag::LuauPatternBudget, true};
+    ScopedFastFlag luauOptimizeStringGsub{DFFlag::LuauOptimizeStringGsub, true};
+
+    StateRef globalState = runConformance("patternbudget.luau");
+    lua_State* L = globalState.get();
+
+    // each case's work is 8192 units at n, which calls no interrupt, and a few more at n + 1, which calls one; so each
+    // charge it makes is checked to the unit
+    std::pair<const char*, int> cases[] = {
+        {"steps", 8191},
+        {"set", 4094},
+        {"setend", 8190},
+        {"frontier", 2729},
+        {"balance", 8189},
+        {"backref", 2718},
+        {"minexpand", 2728},
+        {"maxscan", 1363},
+        {"scanend", 5181},
+        {"scanlongend", 8189},
+        {"position", 4094},
+        {"replacement", 8190},
+        {"escapes", 8190},
+        {"literal", 8192},
+        {"literaltable", 240},
+        {"literalplain", 8192},
+    };
+
+    for (auto [name, n] : cases)
+    {
+        INFO(std::string(name));
+        CHECK(callChargeCase(L, name, n) == 0);
+        CHECK(callChargeCase(L, name, n + 1) == 1);
+    }
+}
+
+TEST_CASE("PatternBudgetOff")
+{
+    ScopedFastFlag luauPatternBudget{DFFlag::LuauPatternBudget, false};
+    ScopedFastFlag luauOptimizeStringGsub{DFFlag::LuauOptimizeStringGsub, true};
+
+    StateRef globalState = runConformance("patternbudget.luau");
+    lua_State* L = globalState.get();
+
+    // without the flag, the interrupt is called at each entry to match() and nowhere else, whatever the work
+    std::pair<const char*, int> entries[] = {
+        {"steps", 1},
+        {"set", 1},
+        {"setend", 1},
+        {"frontier", 1},
+        {"balance", 1},
+        {"backref", 3},
+        {"minexpand", 3},
+        {"maxscan", 3},
+        {"scanend", 2},
+        {"scanlongend", 2},
+        {"position", 20003},
+        {"replacement", 1},
+        {"escapes", 1},
+        {"literal", 0},
+        {"literaltable", 0},
+        {"literalplain", 0},
+    };
+
+    for (auto [name, calls] : entries)
+    {
+        INFO(std::string(name));
+        CHECK(callChargeCase(L, name, 20000) == calls);
+    }
+}
+
+TEST_CASE("PatternBudgetGmatchRetry")
+{
+    static bool raise;
+
+    for (bool patternBudget : {false, true})
+    {
+        ScopedFastFlag luauPatternBudget{DFFlag::LuauPatternBudget, patternBudget};
+
+        StateRef globalState = runConformance("patternbudget.luau");
+        lua_State* L = globalState.get();
+
+        lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+        {
+            if (gc < 0 && raise)
+            {
+                raise = false;
+                luaL_error(L, "timeout");
+            }
+        };
+
+        // the first interrupt call stops the iterator: with the flag, the match costs n + 5 units and the push of its
+        // capture 33, so the call crosses 8192 units in the push for n from 8155 to 8187, and in the scan above; in each
+        // case the same iterator called again returns the first match
+        for (int n = 8155; n <= 8250; n++)
+        {
+            INFO(n);
+
+            raise = false;
+            lua_getglobal(L, "gmatchretry");
+            lua_pushinteger(L, n);
+            REQUIRE(lua_pcall(L, 1, 1, 0) == LUA_OK);
+
+            raise = true;
+            lua_pushvalue(L, -1);
+            CHECK(lua_pcall(L, 0, 1, 0) == LUA_ERRRUN);
+            lua_pop(L, 1);
+
+            raise = false;
+            lua_pushvalue(L, -1);
+            REQUIRE(lua_pcall(L, 0, 1, 0) == LUA_OK);
+            CHECK(strcmp(lua_tostring(L, -1), "1") == 0);
+            lua_pop(L, 2);
+        }
+    }
+}
+
 TEST_CASE("Interrupt")
 {
+    // the hang tests wait for 1000 interrupt calls in each pattern call, which takes 1000 times 8192 units of work with
+    // LuauPatternBudget; PatternBudgetInterrupt tests the pattern functions with it
+    ScopedFastFlag luauPatternBudget{DFFlag::LuauPatternBudget, false};
+
     lua_CompileOptions copts = defaultOptions();
     copts.optimizationLevel = 1; // disable loop unrolling to get fixed expected hit results
 
