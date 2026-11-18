@@ -82,6 +82,7 @@ LUAU_FASTFLAG(LuauGcTraceUdata)
 LUAU_DYNAMIC_FASTFLAG(LuauGcHeapShrinkFix)
 LUAU_DYNAMIC_FASTFLAG(LuauLinearStringSearch)
 LUAU_DYNAMIC_FASTFLAG(LuauPatternBudget)
+LUAU_DYNAMIC_FASTFLAG(LuauPatternClassScan)
 LUAU_DYNAMIC_FASTFLAG(LuauStringPackInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringGsub)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringSplit)
@@ -5388,6 +5389,102 @@ TEST_CASE("PatternBudgetGmatchRetry")
             CHECK(strcmp(lua_tostring(L, -1), "1") == 0);
             lua_pop(L, 2);
         }
+    }
+}
+
+TEST_CASE("PatternClassScan")
+{
+    // results don't change with either value of the flag, with or without an interrupt that returns
+    for (bool patternClassScan : {false, true})
+    {
+        ScopedFastFlag luauPatternClassScan{DFFlag::LuauPatternClassScan, patternClassScan};
+
+        runConformance("classscan.luau");
+        runConformance("pm.luau");
+        runConformance("patternbudget.luau");
+        runConformance(
+            "patternbudget.luau",
+            [](lua_State* L)
+            {
+                lua_callbacks(L)->interrupt = [](lua_State* L, int gc) {};
+            }
+        );
+    }
+}
+
+TEST_CASE("PatternClassScanDifferential")
+{
+    ScopedFastFlag luauPatternClassScan{DFFlag::LuauPatternClassScan, true};
+
+    StateRef globalState = runConformance(
+        "classscan.luau",
+        [](lua_State* L)
+        {
+            lua_pushcfunction(
+                L,
+                [](lua_State* L)
+                {
+                    DFFlag::LuauPatternClassScan.value = lua_toboolean(L, 1);
+                    return 0;
+                },
+                "setclassscan"
+            );
+            lua_setglobal(L, "setclassscan");
+        }
+    );
+    lua_State* L = globalState.get();
+
+    // 85 class forms with 8 suffixes each, over 80 short subjects: every string of up to 3 bytes over 3 letters, and 40
+    // random ones
+    lua_getglobal(L, "differential");
+    lua_pushinteger(L, 40);
+    int status = lua_pcall(L, 1, 1, 0);
+    INFO(std::string(lua_isstring(L, -1) ? lua_tostring(L, -1) : ""));
+    REQUIRE(status == LUA_OK);
+    CHECK(lua_tointeger(L, -1) == 85 * 8 * 80);
+}
+
+TEST_CASE("PatternClassScanCharges")
+{
+    ScopedFastFlag luauPatternBudget{DFFlag::LuauPatternBudget, true};
+
+    StateRef globalState = runConformance("classscan.luau");
+    lua_State* L = globalState.get();
+
+    // as PatternBudgetCharges: 8192 units at n, which call no interrupt, and a few more at n + 1, which call one
+    std::pair<const char*, int> cases[] = {
+        {"find", 8189},
+        {"compile", 8192},
+        {"match", 4079},
+        {"empty", 4095},
+        {"gmatch", 8151},
+        {"plain", 8190},
+    };
+
+    {
+        ScopedFastFlag luauPatternClassScan{DFFlag::LuauPatternClassScan, true};
+
+        for (auto [name, n] : cases)
+        {
+            INFO(std::string(name));
+            CHECK(callChargeCase(L, name, n) == 0);
+            CHECK(callChargeCase(L, name, n + 1) == 1);
+        }
+
+        // a replacement without escapes is charged by its length at each match, as add_s charges it; without the charge,
+        // the 16 MiB result calls no interrupt
+        CHECK(callChargeCase(L, "plainlong", 256) >= 256);
+
+        // '.' with '*' or '+' doesn't scan the subject
+        CHECK(callChargeCase(L, "dotstar", 1 << 20) == 0);
+        CHECK(callChargeCase(L, "dotplus", 1 << 20) == 0);
+    }
+
+    // match() charges more for the same scan
+    {
+        ScopedFastFlag luauPatternClassScan{DFFlag::LuauPatternClassScan, false};
+
+        CHECK(callChargeCase(L, "find", 8189) > 1);
     }
 }
 
