@@ -3688,6 +3688,39 @@ TEST_CASE("ApiAlloc")
     CHECK(udCheck == &ud);
 }
 
+TEST_CASE("GcHeapTriggerAfterHeapShrink")
+{
+    // without the fix, a heap that shrank since the last cycle makes the allocation rate wrap around to about 2^64 bytes per mark duration
+    ScopedFastFlag luauGcHeapShrinkFix{DFFlag::LuauGcHeapShrinkFix, false};
+
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    global_State* g = L->global;
+
+    lua_createtable(L, 0, 0);
+    for (int i = 1; i <= 1000; i++)
+    {
+        lua_createtable(L, 1, 0);
+        lua_rawseti(L, -2, i);
+    }
+
+    // start a cycle
+    for (int i = 0; i < 1000 && g->gcstate == GCSpause; i++)
+        lua_gc(L, LUA_GCSTEP, 0);
+    REQUIRE(g->gcstate != GCSpause);
+
+    // the last cycle ended a second ago with a larger heap, and marking has taken as long as the allocations since then
+    g->gcstats.endtimestamp = g->gcstats.starttimestamp = lua_clock() - 1.0;
+    g->gcstats.endtotalsizebytes = g->totalbytes + (1 << 20);
+
+    for (int i = 0; i < 100000 && g->gcstate != GCSpause; i++)
+        lua_gc(L, LUA_GCSTEP, 0);
+    REQUIRE(g->gcstate == GCSpause);
+
+    // the expected growth is out of the int64_t range and saturates, which makes the trigger the heap size at the end of the cycle
+    CHECK(g->GCthreshold == g->gcstats.endtotalsizebytes);
+}
+
 TEST_CASE("ApiAllocationRateAfterFullGC")
 {
     ScopedFastFlag luauGcHeapShrinkFix{DFFlag::LuauGcHeapShrinkFix, true};
