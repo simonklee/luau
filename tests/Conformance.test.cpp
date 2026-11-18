@@ -80,6 +80,7 @@ LUAU_FASTFLAG(LuauGcTraceUdata)
 LUAU_DYNAMIC_FASTFLAG(LuauGcHeapShrinkFix)
 LUAU_DYNAMIC_FASTFLAG(LuauLinearStringSearch)
 LUAU_DYNAMIC_FASTFLAG(LuauPatternBudget)
+LUAU_DYNAMIC_FASTFLAG(LuauStringPackInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringGsub)
 LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringSplit)
 LUAU_DYNAMIC_FASTFLAG(LuauTableSortInterrupt)
@@ -1855,6 +1856,86 @@ TEST_CASE("PCall")
 TEST_CASE("Pack")
 {
     runConformance("tpack.luau");
+}
+
+TEST_CASE("PackInterrupt")
+{
+    static int calls;
+
+    for (bool stringPackInterrupt : {false, true})
+    {
+        ScopedFastFlag luauStringPackInterrupt{DFFlag::LuauStringPackInterrupt, stringPackInterrupt};
+
+        // results don't change, with an interrupt that returns
+        runConformance(
+            "tpack.luau",
+            [](lua_State* L)
+            {
+                lua_callbacks(L)->interrupt = [](lua_State* L, int gc) {};
+            }
+        );
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+        luaL_openlibs(L);
+
+        // with the flag, the interrupt is called at the 8192nd option, and every 8192 options after it
+        lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+        {
+            if (gc < 0)
+                calls++;
+        };
+
+        for (const char* name : {"pack", "packsize", "unpack"})
+        {
+            INFO(std::string(name));
+
+            for (int n : {8191, 8192, 3 * 8192})
+            {
+                std::string format(n, '=');
+
+                lua_getglobal(L, "string");
+                lua_getfield(L, -1, name);
+                lua_pushlstring(L, format.data(), format.size());
+                if (strcmp(name, "unpack") == 0)
+                    lua_pushstring(L, "");
+
+                calls = 0;
+                REQUIRE(lua_pcall(L, strcmp(name, "unpack") == 0 ? 2 : 1, 0, 0) == LUA_OK);
+                CHECK(calls == (stringPackInterrupt ? n / 8192 : 0));
+
+                lua_pop(L, 1);
+            }
+        }
+
+        // an error from the interrupt stops each of them
+        lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+        {
+            if (gc < 0)
+                luaL_error(L, "timeout");
+        };
+
+        if (stringPackInterrupt)
+        {
+            for (const char* name : {"pack", "packsize", "unpack"})
+            {
+                INFO(std::string(name));
+
+                std::string format(1 << 20, '=');
+
+                lua_getglobal(L, "string");
+                lua_getfield(L, -1, name);
+                lua_pushlstring(L, format.data(), format.size());
+                if (strcmp(name, "unpack") == 0)
+                    lua_pushstring(L, "");
+
+                CHECK(lua_pcall(L, strcmp(name, "unpack") == 0 ? 2 : 1, 0, 0) == LUA_ERRRUN);
+                CHECK(strcmp(lua_tostring(L, -1), "timeout") == 0);
+
+                lua_pop(L, 2);
+            }
+        }
+    }
 }
 
 TEST_CASE("ExplicitTypeInstantiations")
