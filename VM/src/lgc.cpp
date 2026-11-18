@@ -1438,7 +1438,7 @@ static int getgcstepmul(global_State* g)
 static const size_t kHeapLimit = sizeof(size_t) < sizeof(int64_t) ? SIZE_MAX - 1 : size_t(INT64_MAX / 2);
 
 // a * b / c rounded down, exactly, saturated at kHeapLimit; c must not be 0
-static size_t muldiv(uint64_t a, uint64_t b, uint64_t c)
+static LUAU_NOINLINE size_t muldivwide(uint64_t a, uint64_t b, uint64_t c)
 {
     // a * (b / c) + (a / c) * (b % c) + (a % c) * (b % c) / c: only the first term can overflow
     uint64_t bq = b / c;
@@ -1451,6 +1451,21 @@ static size_t muldiv(uint64_t a, uint64_t b, uint64_t c)
     uint64_t rest = (a / c) * br + (a % c) * br / c;
 
     return rest >= kHeapLimit - r ? kHeapLimit : size_t(r + rest);
+}
+
+// muldivwide, with a fast path for 32-bit operands, which step sizes, step multipliers and most debts are: their product
+// fits in 64 bits; inlined, so that a constant c turns the division into a multiplication; larger operands, such as the
+// debt of a heap over 4 GB, take the exact wide path
+static LUAU_FORCEINLINE size_t muldiv(uint64_t a, uint64_t b, uint64_t c)
+{
+    if ((a | b) <= UINT32_MAX)
+    {
+        uint64_t r = a * b / c;
+
+        return r < kHeapLimit ? size_t(r) : kHeapLimit;
+    }
+
+    return muldivwide(a, b, c);
 }
 
 // the heap goal for a goal in percent; a goal of 0 or less gives 0
