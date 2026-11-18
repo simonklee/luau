@@ -5344,7 +5344,8 @@ TEST_CASE("PatternBudgetCharges")
 
     for (auto [name, n] : cases)
     {
-        INFO(std::string(name));
+        std::string label(name);
+        INFO(label);
         CHECK(callChargeCase(L, name, n) == 0);
         CHECK(callChargeCase(L, name, n + 1) == 1);
     }
@@ -5380,14 +5381,15 @@ TEST_CASE("PatternBudgetOff")
 
     for (auto [name, calls] : entries)
     {
-        INFO(std::string(name));
+        std::string label(name);
+        INFO(label);
         CHECK(callChargeCase(L, name, 20000) == calls);
     }
 }
 
 TEST_CASE("PatternBudgetGmatchRetry")
 {
-    static bool raise;
+    static bool raiseNext;
 
     for (bool patternBudget : {false, true})
     {
@@ -5398,9 +5400,9 @@ TEST_CASE("PatternBudgetGmatchRetry")
 
         lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
         {
-            if (gc < 0 && raise)
+            if (gc < 0 && raiseNext)
             {
-                raise = false;
+                raiseNext = false;
                 luaL_error(L, "timeout");
             }
         };
@@ -5412,17 +5414,17 @@ TEST_CASE("PatternBudgetGmatchRetry")
         {
             INFO(n);
 
-            raise = false;
+            raiseNext = false;
             lua_getglobal(L, "gmatchretry");
             lua_pushinteger(L, n);
             REQUIRE(lua_pcall(L, 1, 1, 0) == LUA_OK);
 
-            raise = true;
+            raiseNext = true;
             lua_pushvalue(L, -1);
             CHECK(lua_pcall(L, 0, 1, 0) == LUA_ERRRUN);
             lua_pop(L, 1);
 
-            raise = false;
+            raiseNext = false;
             lua_pushvalue(L, -1);
             REQUIRE(lua_pcall(L, 0, 1, 0) == LUA_OK);
             CHECK(strcmp(lua_tostring(L, -1), "1") == 0);
@@ -5505,7 +5507,8 @@ TEST_CASE("PatternClassScanCharges")
 
         for (auto [name, n] : cases)
         {
-            INFO(std::string(name));
+            std::string label(name);
+            INFO(label);
             CHECK(callChargeCase(L, name, n) == 0);
             CHECK(callChargeCase(L, name, n + 1) == 1);
         }
