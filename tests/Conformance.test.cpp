@@ -5289,6 +5289,7 @@ struct ExactAllocator
     size_t total = 0;
     size_t limit = 0;
     bool mismatch = false;
+    void* last = nullptr; // the latest allocation
 
     // every resize moves the block, so a stale pointer is never kept or reused
     static void* alloc(void* ud, void* ptr, size_t osize, size_t nsize)
@@ -5315,6 +5316,7 @@ struct ExactAllocator
             a->blocks[p] = nsize;
             a->total += nsize;
             a->requests[nsize]++;
+            a->last = p;
         }
 
         if (ptr)
@@ -5512,7 +5514,8 @@ keep2 = kept
         lua_gc(L, LUA_GCCOLLECT, 0);
         luaC_validate(L);
         CHECK(countObjects(L, LUA_TTABLE) == tables);
-        CHECK(a.total < idle + 16 * 1024);
+        // a class that churned keeps full-size pages, so a few objects that survive can hold one each
+        CHECK(a.total < idle + 32 * 1024);
 
         lua_close(L);
 
@@ -5584,6 +5587,318 @@ TEST_CASE("SmallPagesByKind")
         for (void* block : blocks)
             if (block)
                 luaM_free_(L, block, 640, 0);
+
+        lua_close(L);
+
+        CHECK(!a.mismatch);
+        CHECK(a.blocks.empty());
+    }
+}
+
+// a new 8-node table at a time, kept, until the allocator is asked for a page: its size, with the heap still small
+static size_t firstTablePage(lua_State* L, ExactAllocator& a)
+{
+    lua_gc(L, LUA_GCSTOP, 0); // nothing else allocates meanwhile
+    lua_createtable(L, 100, 0);
+    a.requests.clear();
+
+    for (int i = 1; i <= 100; i++)
+    {
+        lua_createtable(L, 0, 8);
+        lua_rawseti(L, -2, i);
+
+        if (!a.requests.empty())
+        {
+            CHECK(a.requests.size() == 1);
+            CHECK(vmBytes(L) < 64 * 1024); // so the heap alone picks 1 KB pages
+            lua_pop(L, 1);
+            return a.requests.begin()->first;
+        }
+    }
+
+    lua_pop(L, 1);
+    return 0;
+}
+
+TEST_CASE("SmallPagesChurn")
+{
+    // a size class whose pages keep emptying gets full-size pages again though the heap stays small, and small ones once
+    // it has been quiet for long enough; one that doesn't churn keeps small pages
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, enabled};
+
+        for (int phase : {0, 1, 2}) // no churn; churn; churn, then quiet cycles
+        {
+            ExactAllocator a;
+            lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+
+            // tables with 8-node hash parts, dropped and collected in rounds
+            if (phase > 0)
+            {
+                for (int round = 0; round < 30; round++)
+                {
+                    for (int i = 0; i < 200; i++)
+                    {
+                        lua_createtable(L, 0, 8);
+                        lua_pop(L, 1);
+                    }
+                    lua_gc(L, LUA_GCCOLLECT, 0);
+                }
+            }
+
+            // cycles in which tables neither allocate nor free a page: 4 for each halving, from 16 KB to 1 KB
+            if (phase == 2)
+            {
+                for (int i = 0; i < 16; i++)
+                    lua_gc(L, LUA_GCCOLLECT, 0);
+            }
+
+            size_t expected = enabled && phase != 1 ? 1024 - 24 : 16 * 1024 - 24;
+            CHECK(firstTablePage(L, a) == expected);
+
+            lua_close(L);
+
+            CHECK(!a.mismatch);
+            CHECK(a.blocks.empty());
+        }
+    }
+}
+
+// one GC cycle with nothing allocated: a full collection, or incremental steps to the end of a cycle
+static void quietCycle(lua_State* L, bool full)
+{
+    if (full)
+    {
+        lua_gc(L, LUA_GCCOLLECT, 0);
+    }
+    else
+    {
+        while (lua_gc(L, LUA_GCSTEP, 0) == 0)
+        {
+        }
+    }
+}
+
+// a class of 200-byte blocks driven to full-size pages: rounds of blocks allocated, freed and collected
+static void churnBlocks(lua_State* L)
+{
+    std::vector<void*> blocks(100);
+    for (int round = 0; round < 30; round++)
+    {
+        for (void*& block : blocks)
+            block = luaM_new_(L, 200, 0);
+        for (void* block : blocks)
+            luaM_free_(L, block, 200, 0);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+    }
+}
+
+TEST_CASE("SmallPagesDecay")
+{
+    ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, true};
+
+    // each 4 quiet cycles halve a churned class's floor, counted once a cycle whether it's full or incremental
+    for (bool full : {true, false})
+    {
+        for (int cycles : {2, 3, 4, 8})
+        {
+            ExactAllocator a;
+            lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+            churnBlocks(L);
+
+            for (int i = 0; i < cycles; i++)
+                quietCycle(L, full);
+
+            lua_gc(L, LUA_GCSTOP, 0);
+            a.requests.clear();
+            void* block = luaM_new_(L, 200, 0);
+            REQUIRE(a.requests.size() == 1);
+            CHECK(a.requests.begin()->first == (16 * 1024 >> (cycles / 4)) - 24);
+            luaM_free_(L, block, 200, 0);
+
+            lua_close(L);
+            CHECK(a.blocks.empty());
+        }
+    }
+
+    // a page refused at a memory cap isn't activity: after 4 cycles of refused retries, a half-size page fits the cap
+    {
+        ExactAllocator a;
+        lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+        churnBlocks(L);
+
+        a.limit = a.total + 12 * 1024;
+        for (int i = 0; i < 4; i++)
+        {
+            CHECK(luaM_trynew_(L, 200, 0) == nullptr);
+            quietCycle(L, false);
+        }
+
+        lua_gc(L, LUA_GCSTOP, 0);
+        a.requests.clear();
+        void* block = luaM_trynew_(L, 200, 0);
+        REQUIRE(block);
+        CHECK(a.requests[8 * 1024 - 24] == 1);
+        luaM_free_(L, block, 200, 0);
+
+        a.limit = 0;
+        lua_close(L);
+        CHECK(!a.mismatch);
+        CHECK(a.blocks.empty());
+    }
+}
+
+// blocks of one size, kept, until the allocator is asked for a page; the first block of that page
+static void* firstBlockOfNewPage(lua_State* L, ExactAllocator& a, size_t size, std::vector<void*>& held, void** page)
+{
+    for (int i = 0; i < 1000; i++)
+    {
+        a.requests.clear();
+        void* block = luaM_new_(L, size, 0);
+
+        if (!a.requests.empty())
+        {
+            *page = a.last;
+            return block;
+        }
+
+        held.push_back(block);
+    }
+
+    return nullptr;
+}
+
+TEST_CASE("SmallPagesKeepOnePage")
+{
+    // a block allocated and freed over and over keeps its page until the GC cycle ends, or the state closes, instead of
+    // turning it over; the class's other pages are full, so the kept page is its only one with free blocks
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, enabled};
+
+        for (bool collect : {true, false})
+        {
+            ExactAllocator a;
+            lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+            lua_gc(L, LUA_GCSTOP, 0);
+
+            std::vector<void*> held;
+            void* page = nullptr;
+            void* block = firstBlockOfNewPage(L, a, 1000, held, &page);
+            REQUIRE(block);
+
+            a.requests.clear();
+            luaM_free_(L, block, 1000, 0);
+            CHECK(a.blocks.count(page) == (enabled ? 1 : 0));
+
+            for (int i = 0; i < 100; i++)
+            {
+                block = luaM_new_(L, 1000, 0);
+                luaM_free_(L, block, 1000, 0);
+            }
+
+            size_t requests = 0;
+            for (auto& [size, count] : a.requests)
+                requests += count;
+            CHECK(requests == (enabled ? 0 : 100));
+            CHECK(a.blocks.count(page) == (enabled ? 1 : 0));
+
+            for (void* b : held)
+                luaM_free_(L, b, 1000, 0);
+
+            if (collect)
+            {
+                // the end of a cycle frees that very page, and leaves no empty page
+                lua_gc(L, LUA_GCRESTART, 0);
+                lua_gc(L, LUA_GCCOLLECT, 0);
+                CHECK(a.blocks.count(page) == 0);
+                CHECK(luaM_countemptypages(L) == 0);
+            }
+
+            lua_close(L);
+
+            CHECK(!a.mismatch);
+            CHECK(a.blocks.empty());
+        }
+    }
+}
+
+TEST_CASE("SmallPagesNoBuriedEmptyPage")
+{
+    // a kept empty page B, then a block freed in a full page A of the same class: A goes on the class's free list, and B
+    // must not stay behind it, where the end of a cycle wouldn't see it
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, enabled};
+
+        for (bool incremental : {false, true})
+        {
+            ExactAllocator a;
+            lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+            lua_gc(L, LUA_GCSTOP, 0);
+
+            // page A, filled; then page B with one block
+            std::vector<void*> held;
+            void* pageA = nullptr;
+            void* first = firstBlockOfNewPage(L, a, 1000, held, &pageA);
+            REQUIRE(first);
+            std::vector<void*> inA = {first};
+            void* pageB = nullptr;
+            void* inB = firstBlockOfNewPage(L, a, 1000, inA, &pageB);
+            REQUIRE(inB);
+
+            luaM_free_(L, inB, 1000, 0);
+            CHECK(a.blocks.count(pageB) == (enabled ? 1 : 0)); // kept: the class's only page with free blocks
+
+            luaM_free_(L, inA.back(), 1000, 0);
+            inA.pop_back();
+            CHECK(a.blocks.count(pageB) == 0); // other classes may keep an empty page until the cycle ends
+
+            lua_gc(L, LUA_GCRESTART, 0);
+            if (incremental)
+            {
+                for (int cycle = 0; cycle < 3; cycle++)
+                    while (lua_gc(L, LUA_GCSTEP, 0) == 0)
+                    {
+                    }
+            }
+            else
+            {
+                lua_gc(L, LUA_GCCOLLECT, 0);
+            }
+            CHECK(luaM_countemptypages(L) == 0);
+
+            for (void* b : held)
+                luaM_free_(L, b, 1000, 0);
+            for (void* b : inA)
+                luaM_free_(L, b, 1000, 0);
+
+            lua_close(L);
+
+            CHECK(!a.mismatch);
+            CHECK(a.blocks.empty());
+        }
+    }
+
+    // the same through scripts: arrays of 32 sizes, each grown once by a key past the array, in a heap padded to 1 MB
+    // so their classes get 16 KB pages; no empty page survives a collection
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, enabled};
+
+        ExactAllocator a;
+        lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+        luaL_openlibs(L);
+
+        runChunk(L, R"(
+local pad = buffer.create(1200000)
+local ks = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,36,40,44,48,52,56,60,64}
+for _, k in ipairs(ks) do local t = table.create(k, 1); t[k + 65] = 1 end
+pad = nil
+)");
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        CHECK(luaM_countemptypages(L) == 0);
 
         lua_close(L);
 
