@@ -16,6 +16,7 @@ LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringSplit, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringGsub, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauLinearStringSearch, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauPatternBudget, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauStringPackInterrupt, true)
 
 // macro to `unsign' a character
 #define uchar(c) ((unsigned char)(c))
@@ -1844,6 +1845,7 @@ typedef struct Header
     lua_State* L;
     int islittle;
     int maxalign;
+    int options; // with LuauStringPackInterrupt, options left before the next interrupt call
 } Header;
 
 /*
@@ -1903,11 +1905,33 @@ static int getnumlimit(Header* h, const char** fmt, int df)
 /*
 ** Initialize Header
 */
+// With LuauStringPackInterrupt, pack, unpack and packsize call the interrupt every this many options: a format string
+// at the heap limit has 33M of them, which take up to 290 ms, and an option's own work is bounded by the bytes it adds
+// or reads
+const int kPackInterruptOptions = 8192;
+
 static void initheader(lua_State* L, Header* h)
 {
     h->L = L;
     h->islittle = nativeendian.little;
     h->maxalign = 1;
+    h->options = kPackInterruptOptions;
+}
+
+static LUAU_NOINLINE void pack_interrupt(Header* h)
+{
+    lua_State* L = h->L;
+    void (*interrupt)(lua_State*, int) = L->global->cb.interrupt;
+
+    h->options = kPackInterruptOptions;
+
+    if (interrupt)
+    {
+        // this interrupt is not yieldable
+        L->nCcalls++;
+        interrupt(L, -1);
+        L->nCcalls--;
+    }
 }
 
 /*
@@ -2007,6 +2031,8 @@ static KOption getoption(Header* h, const char** fmt, int* size)
 */
 static KOption getdetails(Header* h, size_t totalsize, const char** fmt, int* psize, int* ntoalign)
 {
+    if (DFFlag::LuauStringPackInterrupt && --h->options == 0)
+        pack_interrupt(h);
     KOption opt = getoption(h, fmt, psize);
     int align = *psize; // usually, alignment follows size
     if (opt == Kpaddalign)
