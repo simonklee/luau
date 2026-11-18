@@ -883,6 +883,8 @@ static void shrinkbuffers(lua_State* L)
     // check size of string hash
     if (g->strt.nuse < cast_to(uint32_t, g->strt.size / 4) && g->strt.size > LUA_MINSTRTABSIZE * 2)
         stringresizeprotected(L, g->strt.size / 2); // table is too big
+
+    luaM_endcycle(L, true);
 }
 
 static void shrinkbuffersfull(lua_State* L)
@@ -894,6 +896,9 @@ static void shrinkbuffersfull(lua_State* L)
         hashsize /= 2;
     if (hashsize != g->strt.size)
         stringresizeprotected(L, hashsize); // table is too big
+
+    // the cycle that just ended went through shrinkbuffers, which counted it
+    luaM_endcycle(L, false);
 }
 
 static bool deletegco(void* context, lua_Page* page, GCObject* gco)
