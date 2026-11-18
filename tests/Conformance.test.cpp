@@ -88,6 +88,7 @@ LUAU_DYNAMIC_FASTFLAG(LuauTableFindInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableMoveBudget)
 LUAU_DYNAMIC_FASTFLAG(LuauTableForeachInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauGcGoalByHeap)
+LUAU_DYNAMIC_FASTFLAG(LuauSmallPages)
 LUAU_FASTFLAG(LuauPcallErrorContinuationReentry)
 LUAU_FASTFLAG(LuauExperimentalIfLocalSyntax)
 LUAU_FASTFLAG(LuauSandboxFreezesVectorMetatable)
@@ -4796,6 +4797,298 @@ return f, object
     }
 
     CHECK(totalFromRegistry + totalFromL == totalHeap);
+}
+
+// an allocator that knows the size of every block it gave out, checks each free and resize against it, and can be capped
+struct ExactAllocator
+{
+    std::unordered_map<void*, size_t> blocks;
+    std::unordered_map<size_t, int> requests; // allocations by size
+    size_t total = 0;
+    size_t limit = 0;
+    bool mismatch = false;
+
+    // every resize moves the block, so a stale pointer is never kept or reused
+    static void* alloc(void* ud, void* ptr, size_t osize, size_t nsize)
+    {
+        ExactAllocator* a = (ExactAllocator*)ud;
+
+        if (ptr ? a->blocks.count(ptr) == 0 || a->blocks[ptr] != osize : osize != 0)
+            a->mismatch = true;
+
+        void* p = nullptr;
+
+        if (nsize != 0)
+        {
+            if (a->limit && a->total - osize + nsize > a->limit)
+                return nullptr;
+
+            p = malloc(nsize);
+            if (!p)
+                return nullptr;
+
+            if (ptr)
+                memcpy(p, ptr, osize < nsize ? osize : nsize);
+
+            a->blocks[p] = nsize;
+            a->total += nsize;
+            a->requests[nsize]++;
+        }
+
+        if (ptr)
+        {
+            a->blocks.erase(ptr);
+            a->total -= osize;
+            free(ptr);
+        }
+
+        return p;
+    }
+
+    // the distinct sizes of Luau pages allocated: a power of two from 1 KB to 32 KB, less 24 bytes
+    int pageSizes() const
+    {
+        int count = 0;
+        for (size_t size = 1024; size <= 32 * 1024; size *= 2)
+            count += requests.count(size - 24) ? 1 : 0;
+        return count;
+    }
+};
+
+// the VM's count of requested bytes, as lua_gc and lua_totalbytes report it; every way must agree
+static size_t vmBytes(lua_State* L)
+{
+    size_t total = lua_totalbytes(L, -1);
+    CHECK(total == L->global->totalbytes);
+    CHECK(total == size_t(lua_gc(L, LUA_GCCOUNT, 0)) * 1024 + size_t(lua_gc(L, LUA_GCCOUNTB, 0)));
+    return total;
+}
+
+static void runChunk(lua_State* L, const char* source)
+{
+    size_t bytecodeSize = 0;
+    char* bytecode = luau_compile(source, strlen(source), nullptr, &bytecodeSize);
+    int result = luau_load(L, "=chunk", bytecode, bytecodeSize, 0);
+    free(bytecode);
+    REQUIRE(result == 0);
+
+    int status = lua_pcall(L, 0, 0, 0);
+    if (status != LUA_OK)
+        FAIL(lua_tostring(L, -1));
+}
+
+static size_t countObjects(lua_State* L, uint8_t type)
+{
+    struct Context
+    {
+        uint8_t type;
+        size_t count;
+    } ctx = {type, 0};
+
+    luaC_enumheap(
+        L,
+        &ctx,
+        [](void* context, void* ptr, uint8_t tt, uint8_t memcat, size_t size, const char* name)
+        {
+            Context& c = *(Context*)context;
+            c.count += tt == c.type;
+        },
+        [](void* context, void* from, void* to, const char* name) {}
+    );
+
+    return ctx.count;
+}
+
+TEST_CASE("SmallPagesIdleHeap")
+{
+    // a plugin-sized VM: the libraries, a sandbox, a module of closures, after a full collection
+    const char* plugin = R"(
+local M = {}
+local state = { count = 0, items = {}, label = "counter" }
+for i = 1, 40 do
+    M["handler" .. i] = function(x) state.count += i; return state.label .. tostring(x) end
+end
+for i = 1, 20 do
+    state.items[i] = { id = i, name = "item" .. i, tags = { "a", "b" } }
+end
+plugin = M
+)";
+
+    size_t idle[2] = {};
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, enabled};
+
+        ExactAllocator a;
+        lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+
+        luaL_openlibs(L);
+        runChunk(L, plugin);
+        luaL_sandbox(L);
+        luaL_sandboxthread(L);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+
+        idle[enabled] = a.total;
+
+        // the VM counts the bytes it asked for, not the pages around them: 100 userdata of 112 bytes add exactly their size
+        lua_gc(L, LUA_GCSTOP, 0);
+        lua_createtable(L, 100, 0);
+        size_t before = vmBytes(L);
+        for (int i = 1; i <= 100; i++)
+        {
+            lua_newuserdata(L, 112);
+            lua_rawseti(L, -2, i);
+        }
+        CHECK(vmBytes(L) == before + 100 * (offsetof(Udata, data) + 112));
+        CHECK(vmBytes(L) <= a.total);
+
+        lua_pop(L, 1);
+        lua_gc(L, LUA_GCRESTART, 0);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        CHECK(vmBytes(L) < before);
+
+        lua_close(L);
+
+        // every free and resize saw the size the block was allocated with, and nothing is left
+        CHECK(!a.mismatch);
+        CHECK(a.blocks.empty());
+        CHECK(a.total == 0);
+    }
+
+    // the footprint depends on the build (LUA_VECTOR_SIZE changes the sizes of values and table nodes), so the two are
+    // compared with each other; small pages stay under the target for an idle plugin VM in every configuration
+    MESSAGE("idle VM: " << idle[0] << " B with 16 KB pages, " << idle[1] << " B with small pages");
+    CHECK(idle[1] * 2 < idle[0]);
+    CHECK(idle[1] < 120 * 1024);
+}
+
+TEST_CASE("SmallPagesWalks")
+{
+    // pages of several sizes in the same size class: the sweep, the heap walks and the frees handle each by its own size
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, enabled};
+
+        ExactAllocator a;
+        lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+
+        luaL_openlibs(L);
+        runChunk(L, "keep = false keep2 = false");
+        lua_gc(L, LUA_GCCOLLECT, 0);
+
+        size_t tables = countObjects(L, LUA_TTABLE);
+        size_t strings = countObjects(L, LUA_TSTRING);
+        size_t idle = a.total;
+
+        // the heap grows from a few KB to a few MB, so each class gets pages of growing sizes (1 KB to 16 KB)
+        runChunk(L, "keep = {} for i = 1, 30000 do keep[i] = { i, 's' .. i } end");
+        if (enabled)
+            CHECK(a.pageSizes() >= 5);
+        else
+            CHECK(a.pageSizes() <= 2);
+
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        luaC_validate(L);
+        CHECK(countObjects(L, LUA_TTABLE) == tables + 30001);
+        CHECK(countObjects(L, LUA_TSTRING) == strings + 30000);
+
+        // half of the objects die, spread over every page; incremental steps sweep them
+        runChunk(L, "for i = 1, #keep, 2 do keep[i] = false end");
+        lua_gc(L, LUA_GCSETSTEPSIZE, 1);
+        for (int cycle = 0; cycle < 2; cycle++)
+        {
+            while (lua_gc(L, LUA_GCSTEP, 0) == 0)
+                luaC_validate(L);
+        }
+        luaC_validate(L);
+        CHECK(countObjects(L, LUA_TTABLE) == tables + 15001);
+        CHECK(countObjects(L, LUA_TSTRING) == strings + 15000);
+
+#ifdef _WIN32
+        FILE* f = fopen("NUL", "w");
+#else
+        FILE* f = fopen("/dev/null", "w");
+#endif
+        REQUIRE(f);
+        lua_memorydump(L, f, nullptr);
+        fclose(f);
+
+        // churn: short-lived objects with an incremental collector, some kept
+        runChunk(L, R"(
+local kept = {}
+for i = 1, 100000 do
+    local t = { i, tostring(i) }
+    if i % 97 == 0 then table.insert(kept, t) end
+end
+keep2 = kept
+)");
+        luaC_validate(L);
+
+        // every object dies: the pages they held are freed again
+        runChunk(L, "keep = nil keep2 = nil");
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        luaC_validate(L);
+        CHECK(countObjects(L, LUA_TTABLE) == tables);
+        CHECK(a.total < idle + 16 * 1024);
+
+        lua_close(L);
+
+        CHECK(!a.mismatch);
+        CHECK(a.blocks.empty());
+        CHECK(a.total == 0);
+    }
+}
+
+TEST_CASE("SmallPagesMemoryCap")
+{
+    // under a cap, an allocation that fails throws a memory error; the counts stay exact and the VM keeps working
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, enabled};
+
+        ExactAllocator a;
+        lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+        luaL_openlibs(L);
+
+        a.limit = 1 << 20;
+
+        const char* source = "local t = {} for i = 1, 1e6 do t[i] = { i } end";
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source, strlen(source), nullptr, &bytecodeSize);
+        REQUIRE(luau_load(L, "=cap", bytecode, bytecodeSize, 0) == 0);
+        free(bytecode);
+
+        CHECK(lua_pcall(L, 0, 0, 0) == LUA_ERRMEM);
+        lua_pop(L, 1);
+        CHECK(a.total <= a.limit);
+
+        // a refused allocation doesn't change the VM's count
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        lua_gc(L, LUA_GCSTOP, 0);
+        lua_pushcfunction(L, [](lua_State* L) { lua_newuserdata(L, 512 * 1024); return 0; }, "big");
+        size_t limit = a.limit;
+        a.limit = a.total;
+        size_t before = vmBytes(L);
+        CHECK(lua_pcall(L, 0, 0, 0) == LUA_ERRMEM);
+        lua_pop(L, 1);
+        CHECK(vmBytes(L) == before);
+        a.limit = limit;
+        lua_gc(L, LUA_GCRESTART, 0);
+
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        luaC_validate(L);
+        CHECK(L->global->totalbytes <= a.total);
+        CHECK(a.total < a.limit / 2);
+
+        runChunk(L, "local t = {} for i = 1, 1000 do t[i] = { i } end");
+
+        lua_close(L);
+
+        CHECK(!a.mismatch);
+        CHECK(a.blocks.empty());
+        CHECK(a.total == 0);
+    }
 }
 
 TEST_CASE("PatternBudget")
