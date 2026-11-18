@@ -27,6 +27,7 @@
 #include "ConformanceIrHooks.h"
 
 #include "lgc.h"
+#include "lmem.h"
 #include "lstate.h"
 
 #include <algorithm>
@@ -5466,6 +5467,76 @@ keep2 = kept
         CHECK(!a.mismatch);
         CHECK(a.blocks.empty());
         CHECK(a.total == 0);
+    }
+}
+
+TEST_CASE("SmallPagesByKind")
+{
+    // between a 512 KB and a 1 MB heap, a new page for GC objects has the full size, and one for other blocks (which
+    // aren't swept) is half that
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauSmallPages{DFFlag::LuauSmallPages, enabled};
+
+        ExactAllocator a;
+        lua_State* L = lua_newstate(ExactAllocator::alloc, &a);
+        lua_gc(L, LUA_GCSTOP, 0);
+
+        lua_createtable(L, 3000, 0);
+        for (int i = 1; i <= 3000; i++)
+        {
+            lua_newuserdata(L, 200);
+            lua_rawseti(L, -2, i);
+        }
+
+        size_t total = vmBytes(L);
+        REQUIRE(total > 640 * 1024);
+        REQUIRE(total < 960 * 1024);
+
+        // blocks over 512 bytes, until their class needs a new page (the class may have a page with free blocks
+        // already, such as the stack's): userdata of 900 bytes, held in a table sized up front, then 640-byte blocks
+        auto firstPage = [&](auto allocate) -> size_t
+        {
+            for (int i = 0; i < 100; i++)
+            {
+                a.requests.clear();
+                allocate(i);
+                if (!a.requests.empty())
+                {
+                    CHECK(a.requests.size() == 1);
+                    return a.requests.begin()->first;
+                }
+            }
+            return 0;
+        };
+
+        lua_createtable(L, 100, 0);
+        size_t gcoPage = firstPage(
+            [&](int i)
+            {
+                lua_newuserdata(L, 900);
+                lua_rawseti(L, -2, i + 1);
+            }
+        );
+        CHECK(gcoPage == 32 * 1024 - 24);
+
+        std::vector<void*> blocks(100);
+        size_t blockPage = firstPage(
+            [&](int i)
+            {
+                blocks[i] = luaM_new_(L, 640, 0);
+            }
+        );
+        CHECK(blockPage == (enabled ? 16 * 1024 - 24 : 32 * 1024 - 24));
+
+        for (void* block : blocks)
+            if (block)
+                luaM_free_(L, block, 640, 0);
+
+        lua_close(L);
+
+        CHECK(!a.mismatch);
+        CHECK(a.blocks.empty());
     }
 }
 
