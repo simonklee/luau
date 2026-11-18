@@ -4362,6 +4362,12 @@ TEST_CASE("GcGoalArithmetic")
     CHECK(luaC_fullgcthreshold(1000, INT_MAX, 200) == (wide ? size_t(21474835970ull) : SIZE_MAX - 1));
     CHECK(luaC_fullgcthreshold(1000, INT_MAX, INT_MAX) == (wide ? size_t(21474836469ull) : SIZE_MAX - 1));
     CHECK(luaC_fullgcthreshold(SIZE_MAX / 2, INT_MAX, INT_MAX) == limit);
+
+    // both sides of the 32-bit fast path round down the same way: heap * 500 / 300
+    CHECK(luaC_fullgcthreshold(size_t(UINT32_MAX), 200, 300) == (wide ? size_t(7158278825ull) : SIZE_MAX - 1));
+    CHECK(luaC_fullgcthreshold(size_t(UINT32_MAX) / 4, 200, 300) == 1789569705);
+    if (wide)
+        CHECK(luaC_fullgcthreshold(size_t(uint64_t(UINT32_MAX) + 1), 200, 300) == size_t(7158278826ull));
 }
 
 // a fresh state with ~10 KB of live data, the large goal and step multiplier set, and the threshold at 1 KB
