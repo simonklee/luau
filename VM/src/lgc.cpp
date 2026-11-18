@@ -23,6 +23,7 @@ LUAU_FLAGVERSION(LuauGcTraceUdata, 5)
 LUAU_FASTFLAG(LuauCoroutineFinally)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcHeapShrinkFix, false)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcGoalByHeap, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTemplateNilSlots, true)
 LUAU_FASTFLAGVARIABLE(LuauRuntimeFeedback)
 LUAU_FLAGVERSION(LuauRuntimeFeedback, 2)
 LUAU_FASTFLAG(LuauBufferSweep)
@@ -371,13 +372,26 @@ static int traversetable(global_State* g, LuaTable* h)
         while (i--)
             markvalue(g, &h->array[i]);
     }
+    // A constructor template keeps the keys of its fields written `= nil`, so that every clone has their slots and a
+    // later write to one doesn't go through luaH_newkey. The keys are constants of the template's proto, so marking
+    // them keeps nothing alive that the proto doesn't.
+    bool keepnilkeys = DFFlag::LuauTemplateNilSlots && istemplate(obj2gco(h)) && !weakkey;
     i = sizenode(h);
     while (i--)
     {
         LuaNode* n = gnode(h, i);
         LUAU_ASSERT(ttype(gkey(n)) != LUA_TDEADKEY || ttisnil(gval(n)));
         if (ttisnil(gval(n)))
-            removeentry(n); // remove empty entries
+        {
+            if (keepnilkeys && ttype(gkey(n)) != LUA_TDEADKEY)
+            {
+                markvalue(g, gkey(n));
+            }
+            else
+            {
+                removeentry(n); // remove empty entries
+            }
+        }
         else
         {
             LUAU_ASSERT(!ttisnil(gkey(n)));

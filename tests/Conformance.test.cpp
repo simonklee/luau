@@ -29,6 +29,7 @@
 #include "lgc.h"
 #include "lmem.h"
 #include "lstate.h"
+#include "ltable.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -88,6 +89,7 @@ LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringSplit)
 LUAU_DYNAMIC_FASTFLAG(LuauTableSortInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableFindInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableMoveBudget)
+LUAU_DYNAMIC_FASTFLAG(LuauTemplateNilSlots)
 LUAU_DYNAMIC_FASTFLAG(LuauTableForeachInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauGcGoalByHeap)
 LUAU_DYNAMIC_FASTFLAG(LuauSmallPages)
@@ -1482,6 +1484,41 @@ TEST_CASE("Move")
         ScopedFastFlag luauTableMoveBudget{DFFlag::LuauTableMoveBudget, enabled};
 
         runConformance("move.luau");
+    }
+}
+
+TEST_CASE("TemplateNilSlots")
+{
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTemplateNilSlots{DFFlag::LuauTemplateNilSlots, enabled};
+
+        runConformance(
+            "templateslots.luau",
+            [](lua_State* L)
+            {
+                lua_pushboolean(L, DFFlag::LuauTemplateNilSlots);
+                lua_setglobal(L, "templatenilslots");
+
+                // the hash nodes of a table that hold a live key (with a value or not)
+                lua_pushcfunction(
+                    L,
+                    [](lua_State* L)
+                    {
+                        luaL_checktype(L, 1, LUA_TTABLE);
+                        const LuaTable* h = static_cast<const LuaTable*>(lua_topointer(L, 1));
+                        int live = 0;
+                        if (h->node != &luaH_dummynode)
+                            for (int i = 0; i < sizenode(h); i++)
+                                live += !ttisnil(gkey(gnode(h, i))) && ttype(gkey(gnode(h, i))) != LUA_TDEADKEY;
+                        lua_pushinteger(L, live);
+                        return 1;
+                    },
+                    "livekeys"
+                );
+                lua_setglobal(L, "livekeys");
+            }
+        );
     }
 }
 
