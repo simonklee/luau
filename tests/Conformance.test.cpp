@@ -4191,38 +4191,86 @@ static void runGcGoalByHeapCap(const char* source, size_t liveMB)
     free(bytecode);
 }
 
+// the live bytes one piece of a shape holds, with its slot in the array that keeps it, measured over a sample of pieces:
+// object sizes depend on the configuration (LUA_VECTOR_SIZE sets the size of every TValue), so the fixtures are sized
+// from this rather than from a fixed count
+static double gcPieceBytes(const char* make, int sample)
+{
+    char source[256];
+    snprintf(
+        source,
+        sizeof(source),
+        "local function make(i) return %s end\n"
+        "local live = table.create(%d)\n"
+        "for i = 1, %d do live[i] = make(i) end\n"
+        "return live\n",
+        make,
+        sample,
+        sample
+    );
+
+    size_t bytecodeSize = 0;
+    char* bytecode = luau_compile(source, strlen(source), nullptr, &bytecodeSize);
+
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    luaL_openlibs(L);
+
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    size_t base = L->global->totalbytes;
+
+    REQUIRE(luau_load(L, "=gcPieceBytes", bytecode, bytecodeSize, 0) == 0);
+    REQUIRE(lua_pcall(L, 0, 1, 0) == LUA_OK);
+    free(bytecode);
+
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    return double(L->global->totalbytes - base) / sample;
+}
+
 TEST_CASE("GcGoalByHeapEffectiveCap")
 {
-    // 23 MB of live data of each shape, built while making garbage (about 80,000 small tables per MB), then 500,000
-    // more small tables; under a 32 MB limit, at 200% the heap needs about twice the live data. what the collector marks
-    // differs: nothing in a long string, every slot of a table, and a short string is a small object of its own
-    const char* shapes[][3] = {
-        {"string.rep('x', 65536 - 64) .. i", "372", "5000"},
-        {"table.create(256, i)", "5900", "312"},
-        {"{ type = 'span', text = i, fg = 'red', bold = true }", "127000", "16"},
-        {"string.format('%080d', i)", "183000", "8"},
+    // 23 MB of live data of each shape, built while making garbage (about 80,000 small tables per MB with the default
+    // configuration's object sizes), then 500,000 more small tables; under a 32 MB limit, at 200% the heap needs about
+    // twice the live data. what the collector marks differs: nothing in a long string, every slot of a table, and a
+    // short string is a small object of its own. each shape: the piece, a sample of 4 to 13 MB to size it, and the
+    // small tables made with each piece
+    struct Shape
+    {
+        const char* make;
+        int sample;
+        int churn;
     };
 
-    for (auto& shape : shapes)
+    const Shape shapes[] = {
+        {"string.rep('x', 65536 - 64) .. i", 64, 5000},
+        {"table.create(256, i)", 1000, 312},
+        {"{ type = 'span', text = i, fg = 'red', bold = true }", 50000, 16},
+        {"string.format('%080d', i)", 100000, 8},
+    };
+
+    for (const Shape& shape : shapes)
     {
-        INFO(std::string(shape[0]));
+        INFO(std::string(shape.make));
+
+        // a little over 23 MB, as page and table slack differ from the sample
+        int pieces = int(ceil(23.25 * 1024 * 1024 / gcPieceBytes(shape.make, shape.sample)));
 
         char source[512];
         snprintf(
             source,
             sizeof(source),
             "local function make(i) return %s end\n"
-            "local live = table.create(%s)\n"
-            "for i = 1, %s do\n"
+            "local live = table.create(%d)\n"
+            "for i = 1, %d do\n"
             "    live[i] = make(i)\n"
-            "    for j = 1, %s do local t = { j } end\n"
+            "    for j = 1, %d do local t = { j } end\n"
             "end\n"
             "for i = 1, 500000 do local t = { i } end\n"
             "return live\n",
-            shape[0],
-            shape[1],
-            shape[1],
-            shape[2]
+            shape.make,
+            pieces,
+            pieces,
+            shape.churn
         );
 
         runGcGoalByHeapCap(source, 23);
