@@ -3185,6 +3185,386 @@ TEST_CASE("ApiIter")
     lua_pop(L, 19);
 }
 
+// Runs a chunk that returns one value, and pushes the value.
+static void pushChunkResult(lua_State* L, const char* source)
+{
+    size_t size = 0;
+    char* bytecode = luau_compile(source, strlen(source), nullptr, &size);
+    int status = luau_load(L, "=peek", bytecode, size, 0);
+    free(bytecode);
+    REQUIRE(status == 0);
+    REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
+}
+
+// A lua_Peek against the value at idx, as lua_rawiter pushed it. Returns the atom lua_tostringatom gives (which
+// assigns one if the string had none), or -1.
+static int checkPeek(lua_State* L, int idx, const lua_Peek& p)
+{
+    int expected = -1;
+    CHECK(p.type == lua_type(L, idx));
+    if (p.type == LUA_TSTRING)
+    {
+        size_t len = 0;
+        const char* s = lua_tolstring(L, idx, &len);
+        CHECK(p.str == s); // the string object itself, not a copy
+        CHECK(p.len == len);
+        lua_tostringatom(L, idx, &expected);
+        CHECK((p.atom == expected || p.atom < -1)); // as stored: below -1 if useratom hadn't seen it yet
+    }
+    else
+    {
+        CHECK(p.str == nullptr);
+        CHECK(p.len == 0);
+        CHECK(p.atom == -1);
+    }
+    double number = p.type == LUA_TNUMBER ? lua_tonumber(L, idx) : 0;
+    CHECK(memcmp(&p.number, &number, sizeof(double)) == 0); // NaN and -0 too
+    CHECK(p.boolean == (p.type == LUA_TBOOLEAN ? lua_toboolean(L, idx) : 0));
+    return expected;
+}
+
+// Walks the table at idx with lua_rawiterpeek and lua_rawiter in step: the same slots in the same order, the same
+// keys and values, and a push only for LUA_PEEKPUSH and a value that is not a boolean, number or string. Returns the
+// number of slots.
+static int checkIterPeek(lua_State* L, int idx, int flags)
+{
+    idx = lua_absindex(L, idx);
+    int top = lua_gettop(L);
+    int slots = 0;
+    for (int iter = 0;;)
+    {
+        lua_Peek key = {}, value = {};
+        int next = lua_rawiterpeek(L, idx, iter, &key, &value, flags);
+        bool scalar = value.type == LUA_TBOOLEAN || value.type == LUA_TNUMBER || value.type == LUA_TSTRING;
+        int pushed = next >= 0 && (flags & LUA_PEEKPUSH) && !scalar ? 1 : 0;
+        CHECK(lua_gettop(L) == top + pushed);
+
+        CHECK(lua_rawiter(L, idx, iter) == next);
+        if (next < 0)
+        {
+            CHECK(lua_gettop(L) == top);
+            return slots;
+        }
+        int keyAtom = checkPeek(L, -2, key);
+        int valueAtom = checkPeek(L, -1, value);
+        if (pushed)
+            CHECK(lua_rawequal(L, top + 1, -1));
+        lua_settop(L, top);
+
+        // once lua_tostringatom has assigned the atoms, the same step reports them
+        CHECK(lua_rawiterpeek(L, idx, iter, &key, &value, 0) == next);
+        CHECK(key.atom == keyAtom);
+        CHECK(value.atom == valueAtom);
+        iter = next;
+        slots++;
+    }
+}
+
+TEST_CASE("ApiIterPeek")
+{
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    luaL_openlibs(L);
+
+    lua_callbacks(L)->useratom = [](lua_State* L, const char* s, size_t l) -> int16_t
+    {
+        if (l == 4 && memcmp(s, "text", 4) == 0)
+            return 1;
+        if (l == 2 && memcmp(s, "fg", 2) == 0)
+            return 2;
+        return -1;
+    };
+
+    const int flagSets[] = {0, LUA_PEEKPUSH};
+
+    // every shape lua_rawiter walks: empty, arrays with and without holes, the hash part, both, removed fields, and
+    // every type of key and value
+    const char* tables[] = {
+        "return {}",
+        "return table.create(16)",
+        "return {1, 2, 3}",
+        "return {1, nil, 3, nil}",
+        "local t = table.create(8) t[2] = 'b' t[7] = 'g' return t",
+        "local t = {1, 2, 3, 4} t[4] = nil t[1] = nil return t",
+        "return {[1] = 'a', [3] = 'c', [100] = 'z', [-1] = 'm', [0] = 'o', [2.5] = 'h'}",
+        "return {text = 'hello', fg = 'te' .. 'xt', [('f' .. 'g')] = 'fg', bold = true, dim = false, n = 0 / 0, z = -0.0}",
+        "return {'a', 'b', text = 'x', [true] = 1, [false] = 'no', [2.5] = 2}",
+        "local t = {a = 1, b = 2, c = 3, d = 4} t.b = nil t.d = nil return t",
+        "return {s = 'a\\0b', e = '', long = string.rep('x', 1000)}",
+        "return {t = {}, f = print, c = coroutine.create(print), v = vector.create(1, 2, 3), b = buffer.create(4), "
+        "u = newproxy(), [{}] = 'table key', [print] = 'function key', [vector.create(0, 1, 0)] = 'vector key', "
+        "[buffer.create(1)] = 'buffer key', [newproxy()] = 'userdata key', [coroutine.create(print)] = 'thread key'}",
+    };
+
+    for (const char* source : tables)
+    {
+        CAPTURE(source);
+        pushChunkResult(L, source);
+        int expected = -1;
+        for (int flags : flagSets)
+        {
+            CAPTURE(flags);
+            int slots = checkIterPeek(L, -1, flags);
+            if (expected >= 0)
+                CHECK(slots == expected);
+            expected = slots;
+        }
+        lua_pop(L, 1);
+    }
+
+    // light userdata, as a key and as a value (only C makes them); a tagged one keeps its tag through the push
+    lua_newtable(L);
+    lua_pushlightuserdata(L, &globalState);
+    lua_pushlightuserdatatagged(L, L, 3);
+    lua_rawset(L, -3);
+    for (int flags : flagSets)
+        CHECK(checkIterPeek(L, -1, flags) == 1);
+    {
+        lua_Peek key, value;
+        CHECK(lua_rawiterpeek(L, -1, 0, &key, &value, LUA_PEEKPUSH) == 1);
+        CHECK(key.type == LUA_TLIGHTUSERDATA);
+        CHECK(value.type == LUA_TLIGHTUSERDATA);
+        CHECK(lua_tolightuserdatatagged(L, -1, 3) == L);
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+
+    // key may be NULL; the array part comes first, in order
+    pushChunkResult(L, "return {10, 20, 30, x = 'y'}");
+    {
+        lua_Peek value;
+        double sum = 0;
+        int iter = 0, slots = 0;
+        while ((iter = lua_rawiterpeek(L, -1, iter, nullptr, &value, 0)) >= 0)
+        {
+            if (slots < 3)
+                CHECK(iter == slots + 1);
+            sum += value.number;
+            slots++;
+        }
+        CHECK(slots == 4);
+        CHECK(sum == 60);
+    }
+    lua_pop(L, 1);
+
+    // atoms as stored: a string has none (below -1) until lua_tostringatom gives it one, which it keeps; constants
+    // too. Strings are interned, so collect first: no 'text' or 'fg' from the chunks above may still be alive
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    pushChunkResult(L, "return {[string.lower('TEXT')] = 'fg'}");
+    {
+        lua_Peek key, value;
+        CHECK(lua_rawiterpeek(L, -1, 0, &key, &value, 0) == 1);
+        CHECK(key.atom < -1);
+        CHECK(value.atom < -1);
+        REQUIRE(lua_rawiter(L, -1, 0) == 1);
+        int a = 0;
+        lua_tostringatom(L, -2, &a);
+        CHECK(a == 1);
+        lua_tostringatom(L, -1, &a);
+        CHECK(a == 2);
+        lua_pop(L, 2);
+        CHECK(lua_rawiterpeek(L, -1, 0, &key, &value, 0) == 1);
+        CHECK(key.atom == 1);
+        CHECK(value.atom == 2);
+    }
+    lua_pop(L, 1);
+
+    // LUA_PEEKPUSH grows the stack when it is full, as lua_rawiter does
+    pushChunkResult(L, "return {t = {1}}");
+    lua_settop(L, LUA_MINSTACK - 1);
+    lua_pushvalue(L, 1);
+    CHECK(lua_gettop(L) == LUA_MINSTACK);
+    {
+        lua_Peek key, value;
+        CHECK(lua_rawiterpeek(L, -1, 0, &key, &value, LUA_PEEKPUSH) >= 0);
+        CHECK(lua_gettop(L) == LUA_MINSTACK + 1);
+        CHECK(value.type == LUA_TTABLE);
+        CHECK(lua_objlen(L, -1) == 1);
+    }
+    lua_settop(L, 0);
+
+    luaC_validate(L);
+}
+
+TEST_CASE("ApiIterPeekGc")
+{
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    luaL_openlibs(L);
+
+    // 200 fields whose keys and values are strings made at run time, held by the table alone
+    pushChunkResult(L, "local t = {} for i = 1, 200 do t['key' .. i] = string.rep('v', 40) .. i end return t");
+    int t = lua_gettop(L);
+
+    int iter = 0, slots = 0;
+    lua_Peek key, value;
+    while ((iter = lua_rawiterpeek(L, t, iter, &key, &value, 0)) >= 0)
+    {
+        REQUIRE(key.type == LUA_TSTRING);
+        REQUIRE(value.type == LUA_TSTRING);
+        std::string k(key.str, key.len), v(value.str, value.len);
+        CHECK(v == std::string(40, 'v') + k.substr(3));
+
+        // the pointers stay valid across a full collection while the table, on the stack, still holds the strings
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        CHECK(std::string(key.str, key.len) == k);
+        CHECK(std::string(value.str, value.len) == v);
+
+        // a field that exists may be assigned during the walk, and the GC may run; the walk goes on from iter
+        lua_pushlstring(L, k.data(), k.size());
+        lua_pushnil(L);
+        lua_rawset(L, t);
+        lua_gc(L, LUA_GCSTEP, 1);
+        slots++;
+    }
+    CHECK(slots == 200);
+    CHECK(checkIterPeek(L, t, 0) == 0);
+
+    lua_pop(L, 1);
+    luaC_validate(L);
+}
+
+TEST_CASE("ApiIterPeekWeak")
+{
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    luaL_openlibs(L);
+
+    // In a weak table the GC clears a slot by itself, with the table still on the stack and the caller not touching
+    // the slot: a string paired with a dead key ('k') or a dead value ('v') then becomes garbage. So across GC steps a
+    // peeked str is valid only for a table without __mode; these walks never read str after a GC.
+    const char* weak[] = {
+        "local t = setmetatable({}, {__mode = 'k'}) t[{}] = string.rep('w', 1000) .. 'k' return t",
+        "local t = setmetatable({}, {__mode = 'v'}) t[string.rep('w', 1000) .. 'v'] = {} return t",
+        "local t = setmetatable({}, {__mode = 'kv'}) t[{}] = string.rep('w', 1000) .. 'kv' return t",
+        "local t = setmetatable({}, {__mode = 'kv'}) t[{}] = string.rep('w', 1000) .. 'f' return table.freeze(t)",
+        "local t = setmetatable({}, {__mode = 'k'}) t[buffer.create(1)] = string.rep('w', 1000) .. 'b' return table.freeze(t)",
+    };
+    for (const char* source : weak)
+    {
+        CAPTURE(source);
+        pushChunkResult(L, source);
+        int t = lua_gettop(L);
+
+        lua_Peek key, value;
+        REQUIRE(lua_rawiterpeek(L, t, 0, &key, &value, 0) >= 0);
+        CHECK((key.type == LUA_TSTRING || value.type == LUA_TSTRING));
+        CHECK(checkIterPeek(L, t, 0) == 1);
+
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+
+        // the slot is gone though the table stayed on the stack, unchanged by the caller
+        CHECK(lua_gettop(L) == t);
+        CHECK(checkIterPeek(L, t, 0) == 0);
+        lua_pop(L, 1);
+    }
+
+    // no lua_gc needed: any call that allocates can run the step that clears the slot. Here the host's own
+    // lua_pushlstring calls do it (two were enough in the reviewer's run, with the GC primed by the plugin's garbage);
+    // the bound only keeps the test finite
+    pushChunkResult(L, "local t = setmetatable({}, {__mode = 'kv'}) t[{}] = string.rep('w', 1000) .. 'p' return t");
+    {
+        int t = lua_gettop(L);
+        lua_Peek key, value;
+        REQUIRE(lua_rawiterpeek(L, t, 0, &key, &value, 0) >= 0);
+        int calls = 0;
+        while (lua_rawiterpeek(L, t, 0, &key, &value, 0) >= 0 && calls < 1000000)
+        {
+            char text[32]; // a new string each time: an interned one allocates only once
+            int len = snprintf(text, sizeof(text), "s%d", calls);
+            lua_pushlstring(L, text, len);
+            lua_pop(L, 1);
+            calls++;
+        }
+        CHECK(calls < 1000000);
+        CHECK(checkIterPeek(L, t, 0) == 0);
+        lua_pop(L, 1);
+    }
+
+    // the same shapes without __mode keep their slots, and the strings, across collections
+    pushChunkResult(L, "local t = {} t[{}] = string.rep('w', 1000) .. 'k' return t");
+    {
+        lua_Peek key, value;
+        REQUIRE(lua_rawiterpeek(L, -1, 0, &key, &value, 0) >= 0);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        REQUIRE(value.type == LUA_TSTRING);
+        CHECK(std::string(value.str, value.len) == std::string(1000, 'w') + "k");
+        CHECK(checkIterPeek(L, -1, 0) == 1);
+    }
+    lua_pop(L, 1);
+
+    // a pushed table outlives its slot: clear the slot, collect, then read the table through the stack
+    pushChunkResult(L, "local t = {} for i = 1, 50 do t[i] = {string.rep('x', 100) .. i} end return t");
+    {
+        int t = lua_gettop(L);
+        lua_checkstack(L, 60);
+        int iter = 0, pushed = 0;
+        lua_Peek value;
+        while ((iter = lua_rawiterpeek(L, t, iter, nullptr, &value, LUA_PEEKPUSH)) >= 0)
+        {
+            CHECK(value.type == LUA_TTABLE);
+            pushed++;
+        }
+        CHECK(pushed == 50);
+        for (int i = 1; i <= 50; i++)
+        {
+            lua_pushnil(L);
+            lua_rawseti(L, t, i);
+        }
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        for (int i = 1; i <= 50; i++)
+        {
+            lua_rawgeti(L, t + i, 1);
+            CHECK(std::string(lua_tostring(L, -1)) == std::string(100, 'x') + std::to_string(i));
+            lua_pop(L, 1);
+        }
+    }
+    lua_settop(L, 0);
+    luaC_validate(L);
+}
+
+// The reviewer's reproducer: a useratom that runs the GC, while a walk is in a shrinking weak table ('kvs'). The GC
+// frees the table's nodes, so lua_rawiterpeek must not call useratom while it holds a slot; it never calls it.
+static int peekAtomCalls = 0;
+
+TEST_CASE("ApiIterPeekNoCallback")
+{
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    luaL_openlibs(L);
+
+    lua_gc(L, LUA_GCSTOP, 0); // every pair stays until the walk
+    pushChunkResult(L, "local t = setmetatable({}, {__mode = 'kvs'}) "
+                       "for i = 1, 64 do t[{}] = 'v' .. i t['k' .. i] = {} end t.keep = 'kept' return t");
+    int t = lua_gettop(L);
+
+    peekAtomCalls = 0;
+    lua_callbacks(L)->useratom = [](lua_State* L, const char* s, size_t l) -> int16_t
+    {
+        peekAtomCalls++;
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        return -1;
+    };
+
+    lua_Peek key, value;
+    int iter = 0, slots = 0;
+    while ((iter = lua_rawiterpeek(L, t, iter, &key, &value, LUA_PEEKPUSH)) >= 0)
+    {
+        if (value.type == LUA_TTABLE)
+            lua_pop(L, 1);
+        slots++;
+    }
+    CHECK(peekAtomCalls == 0);
+    CHECK(slots == 129);
+
+    lua_callbacks(L)->useratom = nullptr;
+    lua_gc(L, LUA_GCRESTART, 0);
+    lua_pop(L, 1);
+    luaC_validate(L);
+}
+
 static int cpcallTest(lua_State* L)
 {
     bool shouldFail = *(bool*)(lua_tolightuserdata(L, 1));
