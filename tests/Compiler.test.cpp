@@ -25,6 +25,7 @@ LUAU_FASTINT(LuauCompileLoopUnrollThresholdMaxBoost)
 LUAU_FASTINT(LuauRecursionLimit)
 LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 LUAU_DYNAMIC_FASTFLAG(LuauLongStringHash)
+LUAU_DYNAMIC_FASTFLAG(LuauTableKeyedHash)
 LUAU_FASTFLAG(LuauCompileTableFoldFix)
 LUAU_FASTFLAG(LuauExportValueSyntax)
 LUAU_FASTFLAG(DebugLuauNoInline)
@@ -953,10 +954,12 @@ RETURN R0 3
 }
 
 // With DFFlag::LuauLongStringHash each VM hashes a key of 32 bytes or more with its own key, so the dump shows no slot
-// for it, and no conflicts in its table; the short keys' slots are the word hash's
+// for it, and no conflicts in its table; the short keys' slots are the word hash's. With DFFlag::LuauTableKeyedHash too,
+// no key has a known slot (DumpConstantsTablesKeyedTables).
 TEST_CASE("DumpConstantsTablesKeyed")
 {
     ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, true};
+    ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, false};
 
     for (bool keyed : {false, true})
     {
@@ -1010,6 +1013,39 @@ RETURN R0 2
 )"
         );
     }
+}
+
+// With DFFlag::LuauTableKeyedHash each VM keys every string's hash, so the dump shows no slot and no conflict
+TEST_CASE("DumpConstantsTablesKeyedTables")
+{
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, true};
+    ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, true};
+    ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, true};
+
+    CHECK_EQ(
+        "\n" + compileFunction0Constants(R"(
+return {a=1, an_ordinary_field_name_of_32_bytes_A=2, b=4}, {first=10, second=20, third=30}
+)"),
+        R"(
+K0: 'a'
+K1: 1
+K2: 'an_ordinary_field_name_of_32_byt'...
+K3: 2
+K4: 'b'
+K5: 4
+K6: {['a'] = 1 #?, ['an_ordinary_field_name_of_32_byt'...] = 2 #?, ['b'] = 4 #?} sizenode=4
+K7: 'first'
+K8: 10
+K9: 'second'
+K10: 20
+K11: 'third'
+K12: 30
+K13: {['first'] = 10 #?, ['second'] = 20 #?, ['third'] = 30 #?} sizenode=4
+DUPTABLE R0 6
+DUPTABLE R1 13
+RETURN R0 2
+)"
+    );
 }
 
 TEST_CASE("DumpConstantClass")

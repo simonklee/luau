@@ -6,6 +6,7 @@ local ignore =
 	-- these are permanently ignored, as they are only exposed in tests
 	"_G.limitedstack",
 	"_G.shortstringhash",
+	"_G.keyedtables",
 	"_G.RTTI",
 	"_G.collectgarbage",
 	"_G.loadstring",

@@ -17,6 +17,8 @@
 #include <string_view>
 
 LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
+LUAU_DYNAMIC_FASTFLAG(LuauLongStringHash)
+LUAU_DYNAMIC_FASTFLAG(LuauTableKeyedHash)
 LUAU_FASTFLAG(LuauCodegenMarkUsed)
 LUAU_FASTFLAG(DebugLuauBufferVectorFastcalls)
 LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
@@ -8603,7 +8605,10 @@ TEST_CASE_FIXTURE(LoweringFixture, "UserdataDirectNamecall")
 
     assemblyOptions.includeOutlinedCode = true;
 
-    // GET_HASH_NODE_ADDR takes the hash of the VM that compiles: luaS_hash's with the flag off, luaS_wordhash's with it on
+    // GET_HASH_NODE_ADDR takes the hash of the VM that compiles: luaS_hash's with the flag off, luaS_wordhash's with it on.
+    // A VM that keys its strings (DFFlag::LuauTableKeyedHash) bakes in none: checked after the loop.
+    ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, false};
+
     for (bool wordHash : {false, true})
     {
         ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, wordHash};
@@ -8665,5 +8670,16 @@ end
             expected
         );
     }
+
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, true};
+    ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, true};
+    ScopedFastFlag keyed{DFFlag::LuauTableKeyedHash, true};
+    std::string keyedAssembly = getCodegenAssembly(R"(
+local function foo(a)
+    return a:Foo(1)
+end
+)");
+    CHECK(keyedAssembly.find("GET_HASH_NODE_ADDR") == std::string::npos);
+    CHECK(keyedAssembly.find("INVOKE_NAMECALL") != std::string::npos);
 }
 TEST_SUITE_END();
