@@ -9,12 +9,14 @@ target_sources(Luau.Common PRIVATE
     Common/include/Luau/HashUtil.h
     Common/include/Luau/InsertionOrderedMap.h
     Common/include/Luau/SmallVector.h
+    Common/include/Luau/StringHash.h
     Common/include/Luau/StringUtils.h
     Common/include/Luau/TimeTrace.h
     Common/include/Luau/Variant.h
     Common/include/Luau/VecDeque.h
 
     Common/src/BytecodeWire.cpp
+    Common/src/StringHash.cpp
     Common/src/StringUtils.cpp
     Common/src/TimeTrace.cpp
 )

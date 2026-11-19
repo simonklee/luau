@@ -20,6 +20,7 @@
 using namespace Luau;
 using namespace Luau::Bytecode;
 
+LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 LUAU_FASTFLAG(LuauInlinerNamecallSelfFromMove)
 
 namespace
@@ -34,6 +35,9 @@ struct BytecodeRes
 
 struct BytecodeInlinerFixture
 {
+    // The expected dumps show the predicted slots of luaS_hash, the compiler's hash with the flag off
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, false};
+
     std::string printFunction(CompTimeBcFunction& function)
     {
         BytecodeBuilder bcb;

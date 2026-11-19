@@ -246,8 +246,9 @@ assert((function() local a = {} for k,v in pairs({a=1, b=2, c=3}) do a[k] = v en
 
 -- pairs on mixed array/table + gaps in the array portion
 -- note that a,b,c results in a,c,b during traversal since index is based on hash & size
-assert((function() local a = {} for k,v in pairs({1, 2, 3, a=5, b=6, c=7}) do a[#a+1] = v end return table.concat(a, ',') end)() == "1,2,3,5,7,6")
-assert((function() local a = {} for k,v in pairs({1, 2, 3, nil, 4, a=5, b=6, c=7}) do a[#a+1] = v end return table.concat(a, ',') end)() == "1,2,3,4,5,7,6")
+-- (with luaS_hash; with DFFlag::LuauShortStringHash, shortstringhash here, it's a,b,c)
+assert((function() local a = {} for k,v in pairs({1, 2, 3, a=5, b=6, c=7}) do a[#a+1] = v end return table.concat(a, ',') end)() == (if shortstringhash then "1,2,3,5,6,7" else "1,2,3,5,7,6"))
+assert((function() local a = {} for k,v in pairs({1, 2, 3, nil, 4, a=5, b=6, c=7}) do a[#a+1] = v end return table.concat(a, ',') end)() == (if shortstringhash then "1,2,3,4,5,6,7" else "1,2,3,4,5,7,6"))
 
 -- pairs manually
 assert((function() local a = '' for k in next,{5, 6, 7} do a = a .. k end return a end)() == "123")
@@ -306,6 +307,7 @@ assert((function() return table.concat({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1
 assert((function() return table.concat({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}, ',') end)() == "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17")
 
 -- some scripts rely on exact table traversal order; while it's evil to do so, let's check that it works
+-- (the order depends on the string hash: shortstringhash is the VM's DFFlag::LuauShortStringHash)
 assert((function()
     local kSelectedBiomes = {
         ['Mountains'] = true,
@@ -321,7 +323,7 @@ assert((function()
     local result = ""
     for k in pairs(kSelectedBiomes) do result = result .. k end
     return result
-end)() == "ArcticDunesCanyonsWaterMountainsHillsLavaflowPlainsMarsh")
+end)() == (if shortstringhash then "MountainsArcticCanyonsLavaflowPlainsHillsDunesWaterMarsh" else "ArcticDunesCanyonsWaterMountainsHillsLavaflowPlainsMarsh"))
 
 -- table literals may contain duplicate fields; the language doesn't specify assignment order but we currently assign left to right
 assert((function() local t = {data = 4, data = nil, data = 42} return t.data end)() == 42)

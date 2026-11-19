@@ -23,6 +23,7 @@ LUAU_FASTINT(LuauCompileInlineThresholdMaxBoost)
 LUAU_FASTINT(LuauCompileLoopUnrollThreshold)
 LUAU_FASTINT(LuauCompileLoopUnrollThresholdMaxBoost)
 LUAU_FASTINT(LuauRecursionLimit)
+LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 LUAU_FASTFLAG(LuauCompileTableFoldFix)
 LUAU_FASTFLAG(LuauExportValueSyntax)
 LUAU_FASTFLAG(DebugLuauNoInline)
@@ -917,6 +918,9 @@ RETURN R0 1
 
 TEST_CASE("DumpConstantsTables")
 {
+    // the dump shows the primary slots of luaS_hash, the compiler's hash with the flag off; ShortStringHashSlots covers it on
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, false};
+
     CHECK_EQ(
         "\n" + compileFunction0Constants(R"(
 return {a=1,b=2,c=3}, {only=42}, {first=10, second=20, third=30}
@@ -15176,6 +15180,9 @@ TEST_CASE("ClassNestingExceedsUpvalueLimit")
 
 TEST_CASE("ClassConstruction")
 {
+    // the dump shows the primary slots of luaS_hash, the compiler's hash with the flag off; ShortStringHashSlots covers it on
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, false};
+
     ScopedFastFlag sff{FFlag::DebugLuauUserDefinedClasses, true};
 
     CHECK_EQ(

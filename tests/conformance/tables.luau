@@ -822,7 +822,8 @@ end)() == nil)
 
 
 -- check that tables with constant keys maintain their insertion/iteration order
--- this is important to maintain for backwards compat
+-- this is important to maintain for backwards compat: a constructor with constant keys iterates in the order of the
+-- same keys assigned one by one (which order that is depends on the string hash)
 do
   local ordering = {
     foo = 1,
@@ -830,21 +831,28 @@ do
     thing = true
   }
 
+  local assigned = {}
+  assigned.foo = 1
+  assigned.bar = "string"
+  assigned.thing = true
+
+  local keys, values = {}, {}
+  for key, val in assigned do
+    table.insert(keys, key)
+    table.insert(values, val)
+  end
+  assert(#keys == 3)
+
   local idx = 1
   for key, val in ordering do
-    if idx == 3 then
-      assert(key == "foo")
-      assert(val == 1)
-    elseif idx == 2 then
-      assert(key == "bar")
-      assert(val == "string")
-    elseif idx == 1 then
-      assert(key == "thing")
-      assert(val == true)
-    end
-
+    assert(key == keys[idx])
+    assert(val == values[idx])
     idx += 1
   end
+  assert(idx == 4)
+
+  -- and the order itself, for each string hash (shortstringhash is the VM's DFFlag::LuauShortStringHash)
+  assert(table.concat(keys, ",") == (if shortstringhash then "bar,thing,foo" else "thing,bar,foo"))
 end
 
 do
