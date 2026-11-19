@@ -851,8 +851,9 @@ do
   end
   assert(idx == 4)
 
-  -- and the order itself, for each string hash (shortstringhash is the VM's DFFlag::LuauShortStringHash)
-  assert(table.concat(keys, ",") == (if shortstringhash then "bar,thing,foo" else "thing,bar,foo"))
+  -- and the order itself, for each string hash (shortstringhash is the VM's DFFlag::LuauShortStringHash, keyedtables its
+  -- DFFlag::LuauTableKeyedHash under the runner's fixed seed)
+  assert(table.concat(keys, ",") == (if keyedtables then "foo,thing,bar" elseif shortstringhash then "bar,thing,foo" else "thing,bar,foo"))
 end
 
 do

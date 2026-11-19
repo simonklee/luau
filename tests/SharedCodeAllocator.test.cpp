@@ -23,6 +23,7 @@
 
 LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 LUAU_DYNAMIC_FASTFLAG(LuauLongStringHash)
+LUAU_DYNAMIC_FASTFLAG(LuauTableKeyedHash)
 
 using namespace Luau::CodeGen;
 
@@ -503,17 +504,19 @@ TEST_CASE("SharedAllocation")
 // Native code bakes in the compiling VM's string hashes (a method name's main slot), so a module compiled in a VM with
 // one string hash (DFFlag::LuauShortStringHash, read when the VM is created) must not be bound in a VM with the other:
 // there, `t:Foo()` would probe the wrong slot, find it empty and take `Foo` from `__index`. With DFFlag::LuauLongStringHash
-// each VM hashes a name of 32 bytes or more with its own key, so its native code bakes in no such hash.
+// each VM hashes a name of 32 bytes or more with its own key, so its native code bakes in no such hash; with
+// DFFlag::LuauTableKeyedHash it keys every name, and its native code bakes in no string hash at all.
 TEST_CASE("SharedAllocationMixedStringHash")
 {
     if (!luau_codegen_supported())
         return;
 
-    // 0: 747's hash; 1: the word hash; 2: the word hash with keyed long strings
+    // 0: 747's hash; 1: the word hash; 2: the word hash with keyed long strings; 3: with every string keyed
     auto newState = [](int mode)
     {
         ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, mode >= 1};
         ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, mode >= 2};
+        ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, mode >= 3};
         return std::unique_ptr<lua_State, void (*)(lua_State*)>{luaL_newstate(), lua_close};
     };
 
@@ -578,9 +581,9 @@ TEST_CASE("SharedAllocationMixedStringHash")
             return result;
         };
 
-        for (int firstMode : {0, 1, 2})
+        for (int firstMode : {0, 1, 2, 3})
         {
-            for (int secondMode : {0, 1, 2})
+            for (int secondMode : {0, 1, 2, 3})
             {
                 INFO("method " << method << ", first VM's hash " << firstMode << ", second " << secondMode);
 
@@ -602,7 +605,7 @@ TEST_CASE("SharedAllocationMixedStringHash")
     }
 }
 
-// VMs of all three string hashes (747's, the word hash, the word hash with keyed long strings) compiling, running and
+// VMs of all four string hashes (747's, the word hash, with keyed long strings, with every string keyed) compiling, running and
 // releasing modules in one shared context at once, with a short and a long method name. All partitions
 // share one SharedCodeAllocator, so allocation and release in the CodeAllocator happen under its one mutex. A data race
 // here shows up under ThreadSanitizer (make config=tsan CXX="clang++ -fsanitize=thread"), not as a failed check.
@@ -641,9 +644,10 @@ TEST_CASE("SharedAllocationMixedStringHashThreads")
                         // VMs are made on one thread at a time: the flag is a global
                         static std::mutex flagMutex;
                         std::unique_lock lock{flagMutex};
-                        int mode = (t + round) % 3;
+                        int mode = (t + round) % 4;
                         ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, mode >= 1};
                         ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, mode >= 2};
+                        ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, mode >= 3};
                         L = luaL_newstate();
                         create(L, sharedCodeGenContext.get());
                     }

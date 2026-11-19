@@ -30,6 +30,7 @@
 #include "lgc.h"
 #include "lmem.h"
 #include "lstate.h"
+#include "lstring.h"
 #include "ltable.h"
 
 #include <algorithm>
@@ -411,6 +412,10 @@ static StateRef runConformance(
     // The VM's string hash (DFFlag::LuauShortStringHash when it was created), for scripts that pin string-key order
     lua_pushboolean(L, L->global->strt.wordhash);
     lua_setglobal(L, "shortstringhash");
+    // Whether it also keys short strings and table main positions (DFFlag::LuauTableKeyedHash), seeded by
+    // DFInt::LuauStringHashSeed, which this runner fixes
+    lua_pushboolean(L, L->global->strt.keyedtables);
+    lua_setglobal(L, "keyedtables");
 
     // Extra test-specific setup
     if (setup)
@@ -1379,6 +1384,8 @@ TEST_CASE("Assert")
 
 TEST_CASE("Basic")
 {
+    // basic.luau pins its iteration orders for the seed runConformance fixes; an explicit seed (--fflags) would change them
+    ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
     runConformance("basic.luau");
 }
 
@@ -1433,6 +1440,8 @@ TEST_CASE("Tables")
     for (bool enabled : {false, true})
     {
         ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, enabled};
+        // this test makes its own state, so it fixes the seed of keyed tables' order itself (runConformance's comment)
+        ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
 
         reallocSizeLimit = 0;
 
@@ -2489,6 +2498,8 @@ TEST_CASE("Debug")
 
 TEST_CASE("LazyLoad")
 {
+    // basic.luau and tables.luau pin their iteration orders for the seed runConformance fixes; an explicit seed (--fflags) would change them
+    ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
     ScopedLazyLoad scopedLazyLoad;
 
     ScopedFastFlag sffs[] = {
@@ -2864,6 +2875,8 @@ TEST_CASE("Debugger")
 
 TEST_CASE("InterruptInspection")
 {
+    // basic.luau pins its iteration orders for the seed runConformance fixes; an explicit seed (--fflags) would change them
+    ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
     static bool skipbreak = false;
 
     runConformance(
@@ -3043,9 +3056,12 @@ TEST_CASE("SameHash")
 }
 
 // The compiler's predicted slots are the slots the VM uses, with the flag off and on: a table constructor's keys sit
-// where BytecodeBuilder::getStringHash puts them, in a VM created under the same flag
+// where BytecodeBuilder::getStringHash puts them, in a VM created under the same flag. Not with DFFlag::LuauTableKeyedHash,
+// whose VMs key every string's hash (TableKeyedHash checks that predictions only miss there)
 TEST_CASE("ShortStringHashSlots")
 {
+    ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, false};
+
     for (bool enabled : {false, true})
     {
         ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, enabled};
@@ -3502,6 +3518,367 @@ TEST_CASE("LongStringHash")
         runConformance("shorthash.luau");
         runConformance("strings.luau");
     }
+}
+
+// DFFlag::LuauTableKeyedHash: keys chosen against 747's public hashes share one main position without the flag, and
+// spread like random keys with it. The seed is fixed (DFInt::LuauStringHashSeed), so that the bounds are exact results.
+TEST_CASE("TableKeyedHash")
+{
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, true};
+    ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, true};
+    ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
+
+    // keys whose unkeyed hashes have 13 low zero bits: one main position in any table of up to 8192 nodes
+    const int N = 4096;
+    const uint32_t lowMask = 8191;
+
+    auto inverse = [](uint32_t a)
+    {
+        uint32_t x = a;
+        for (int i = 0; i < 5; i++)
+            x *= 2 - a * x;
+        return x;
+    };
+
+    // 747's number hash, MurmurHash64B's finalizer on the double's words (sign masked), is a bijection: inverted, each
+    // double costs O(1)
+    std::vector<double> numbers;
+    {
+        const uint32_t m = 0x5bd1e995, minv = inverse(m);
+        REQUIRE(m * minv == 1);
+        for (uint32_t j = 1; numbers.size() < size_t(N); j++)
+        {
+            uint32_t h1 = j * 2654435761u, h2 = j << 13;
+            h2 *= minv, h2 ^= h1 >> 19, h1 *= minv, h1 ^= h2 >> 17;
+            h2 *= minv, h2 ^= h1 >> 22, h1 *= minv, h1 ^= h2 >> 18;
+            if (h2 >= 0x80000000 || (h2 & 0x7ff00000) == 0x7ff00000)
+                continue;
+            uint32_t words[2] = {h1, h2};
+            double d;
+            memcpy(&d, words, sizeof(d));
+            numbers.push_back(d);
+        }
+    }
+
+    // short strings, by brute force against the unkeyed word hash: 2^13 tries each
+    std::vector<std::string> strings;
+    for (uint64_t i = 0; strings.size() < size_t(N); i++)
+    {
+        char key[8];
+        memcpy(key, &i, 8);
+        if ((Luau::wordHashShort(8, key, 8) & lowMask) == 0)
+            strings.push_back(std::string(key, 8));
+    }
+
+    // light userdata: 747 hashes the low 32 bits of an address with MurmurHash3's finalizer, a bijection
+    std::vector<void*> pointers;
+    {
+        const uint32_t c1inv = inverse(0x85ebca6bu), c2inv = inverse(0xc2b2ae35u);
+        for (uint32_t j = 1; pointers.size() < size_t(N); j++)
+        {
+            uint32_t h = j << 13;
+            h ^= h >> 16, h *= c2inv, h ^= (h >> 13) ^ (h >> 26), h *= c1inv, h ^= h >> 16;
+            pointers.push_back(reinterpret_cast<void*>(uintptr_t(h)));
+        }
+    }
+
+    // vectors (x, 0, 0) that share one 747 hash. With float components 747 hashes x's bits i as (i ^ i >> 17) * 73856093,
+    // so i = j << 17 | j gives j << 17; with double ones (LUA_VECTOR_DOUBLE) it folds the 64 bits at 32 and keeps the low
+    // word of the product, so i = j << 32 | j gives 0
+    std::vector<LUA_VECTOR_TYPE> xs;
+    for (uint32_t j = 1; xs.size() < size_t(N); j++)
+    {
+#if LUA_VECTOR_DOUBLE
+        uint64_t i = (uint64_t(j) << 32) | j;
+#else
+        uint32_t i = (j << 17) | j;
+#endif
+        LUA_VECTOR_TYPE x;
+        static_assert(sizeof(x) == sizeof(i), "a component's bits");
+        memcpy(&x, &i, sizeof(x));
+        xs.push_back(x);
+    }
+    auto pushVector = [](lua_State* L, LUA_VECTOR_TYPE x, LUA_VECTOR_TYPE y, LUA_VECTOR_TYPE z, LUA_VECTOR_TYPE w)
+    {
+#if LUA_VECTOR_SIZE == 4
+        lua_pushvector(L, x, y, z, w);
+#else
+        (void)w;
+        lua_pushvector(L, x, y, z);
+#endif
+    };
+
+    // the longest chain of a table's hash part, from any node
+    auto longestChain = [](const LuaTable* h)
+    {
+        int longest = 0;
+        for (int i = 0; i < sizenode(h); i++)
+        {
+            const LuaNode* n = gnode(h, i);
+            int length = 1;
+            while (gnext(n) != 0)
+                n += gnext(n), length++;
+            longest = std::max(longest, length);
+        }
+        return longest;
+    };
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, enabled};
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+        REQUIRE(L->global->strt.keyedtables == enabled);
+
+        // inserts the N keys into the table on top with values from base + 1, and checks that each is found
+        auto fill = [&](auto push, int base)
+        {
+            for (int i = 0; i < N; i++)
+            {
+                push(i);
+                lua_pushinteger(L, base + i + 1);
+                lua_rawset(L, -3);
+            }
+        };
+        auto check = [&](auto push, int base)
+        {
+            for (int i = 0; i < N; i++)
+            {
+                push(i);
+                lua_rawget(L, -2);
+                CHECK_EQ(lua_tointeger(L, -1), base + i + 1);
+                lua_pop(L, 1);
+            }
+        };
+
+        // builds a table of the N keys, checks that each is found, and returns its longest chain
+        auto chain = [&](const char* kind, auto push)
+        {
+            INFO("flag " << enabled << ", " << kind);
+            lua_createtable(L, 0, 0);
+            fill(push, 0);
+            check(push, 0);
+            int longest = longestChain(static_cast<const LuaTable*>(lua_topointer(L, -1)));
+            lua_pop(L, 1);
+            return longest;
+        };
+
+        int numberChain = chain(
+            "numbers",
+            [&](int i)
+            {
+                lua_pushnumber(L, numbers[i]);
+            }
+        );
+        int stringChain = chain(
+            "strings",
+            [&](int i)
+            {
+                lua_pushlstring(L, strings[i].data(), strings[i].size());
+            }
+        );
+        int pointerChain = chain(
+            "light userdata",
+            [&](int i)
+            {
+                lua_pushlightuserdata(L, pointers[i]);
+            }
+        );
+        int vectorChain = chain(
+            "vectors",
+            [&](int i)
+            {
+                pushVector(L, xs[i], 0, 0, 0);
+            }
+        );
+
+        // objects as keys (their addresses aren't chosen, but the keyed path must find them)
+        lua_createtable(L, N, 0);
+        for (int i = 0; i < N; i++)
+        {
+            lua_createtable(L, 0, 0);
+            lua_rawseti(L, -2, i + 1);
+        }
+        // the table of objects is under the one being built when push runs
+        int objectChain = chain(
+            "tables",
+            [&](int i)
+            {
+                lua_rawgeti(L, -2, i + 1);
+            }
+        );
+        lua_pop(L, 1);
+
+        INFO("flag " << enabled);
+        if (enabled)
+        {
+            CHECK(numberChain <= 16);
+            CHECK(stringChain <= 16);
+            CHECK(pointerChain <= 16);
+            CHECK(vectorChain <= 16);
+        }
+        else
+        {
+            CHECK(numberChain >= N);
+            CHECK(stringChain >= N);
+            CHECK(pointerChain >= N);
+            CHECK(vectorChain >= N);
+        }
+        CHECK(objectChain <= 16);
+
+        // -0 and 0 are one key, as numbers and as vector components
+        lua_createtable(L, 0, 0);
+        lua_pushnumber(L, 0.0);
+        lua_pushinteger(L, 1);
+        lua_rawset(L, -3);
+        lua_pushnumber(L, -0.0);
+        lua_rawget(L, -2);
+        CHECK_EQ(lua_tointeger(L, -1), 1);
+        lua_pop(L, 1);
+        pushVector(L, 0.0, -0.0, 1.0, 0.0);
+        lua_pushinteger(L, 2);
+        lua_rawset(L, -3);
+        pushVector(L, -0.0, 0.0, 1.0, -0.0);
+        lua_rawget(L, -2);
+        CHECK_EQ(lua_tointeger(L, -1), 2);
+        lua_pop(L, 2);
+
+        // a VM keeps its mode when the flag flips: a table filled before the flip finds its keys after it, takes new
+        // ones, and new tables hash as before
+        auto pushNumber = [&](int i)
+        {
+            lua_pushnumber(L, numbers[i]);
+        };
+        auto pushString = [&](int i)
+        {
+            lua_pushlstring(L, strings[i].data(), strings[i].size());
+        };
+        auto pushPointer = [&](int i)
+        {
+            lua_pushlightuserdata(L, pointers[i]);
+        };
+        lua_createtable(L, 0, 0);
+        fill(pushNumber, 0);
+        fill(pushString, N);
+        {
+            ScopedFastFlag flipped{DFFlag::LuauTableKeyedHash, !enabled};
+            CHECK(L->global->strt.keyedtables == enabled);
+            check(pushNumber, 0);
+            check(pushString, N);
+            fill(pushPointer, 2 * N);
+            check(pushNumber, 0);
+            check(pushString, N);
+            check(pushPointer, 2 * N);
+            CHECK_EQ(chain("numbers after a flip", pushNumber), numberChain);
+            CHECK_EQ(chain("strings after a flip", pushString), stringChain);
+        }
+        lua_pop(L, 1);
+    }
+
+    // Two VMs with different seeds key differently: the same short string gets different stored hashes
+    {
+        ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, true};
+        StateRef first(luaL_newstate(), lua_close);
+        unsigned int firstHash = luaS_new(first.get(), "session")->hash;
+
+        // seed 1 gives the same keys, short-string hash and number mix on every platform: the seed is hashed as
+        // little-endian bytes, and the mixes are 64-bit arithmetic
+        const stringtable& strt = first.get()->global->strt;
+        const uint64_t* key = strt.tablekey;
+        CHECK_EQ(key[0], 0x981e02c59b605114ull);
+        CHECK_EQ(key[1], 0x278b61b35fa1d817ull);
+        CHECK_EQ(strt.shortkey[0], 0x90a89100263a9f82ull);
+        CHECK_EQ(strt.shortkey[1], 0xdf673ec7f7837d09ull);
+        CHECK_EQ(firstHash, 1241407720u);
+        double onePointFive = 1.5;
+        uint64_t bits;
+        memcpy(&bits, &onePointFive, sizeof(bits));
+        CHECK_EQ(luaH_keymix(key, bits), 0x53411126b39a2079ull);
+        ScopedFastInt otherSeed{DFInt::LuauStringHashSeed, 2};
+        StateRef second(luaL_newstate(), lua_close);
+        CHECK(firstHash != luaS_new(second.get(), "session")->hash);
+        CHECK(first.get()->global->strt.tablekey[0] != second.get()->global->strt.tablekey[0]);
+        CHECK(first.get()->global->strt.shortkey[0] != second.get()->global->strt.shortkey[0]);
+        CHECK((second.get()->global->strt.tablekey[1] & 1) == 1);
+
+        // the short-string key is drawn apart from the table key: luaS_keyshort is linear, and table order shows enough of
+        // its key to recover most of it, which must say nothing about luaH_keymix's key
+        for (lua_State* L : {first.get(), second.get()})
+        {
+            const stringtable& tb = L->global->strt;
+            CHECK(tb.shortkey[0] != tb.tablekey[0]);
+            CHECK(tb.shortkey[1] != tb.tablekey[1]);
+            CHECK(tb.shortkey[0] != tb.tablekey[1]);
+            CHECK(tb.shortkey[1] != tb.tablekey[0]);
+            unsigned int v = Luau::wordHashShort(7, "session", 7);
+            CHECK_EQ(luaS_new(L, "session")->hash, luaS_keyshort(tb.shortkey, v));
+            CHECK(luaS_keyshort(tb.tablekey, v) != luaS_keyshort(tb.shortkey, v));
+        }
+    }
+}
+
+// With DFFlag::LuauTableKeyedHash, resize reinserts keys whose main positions are free first (ltable.cpp, reinsertfree),
+// so that no reinsertion moves a colliding node. Here a test that knows the VM's key (a fixed seed) builds carbon's
+// layout against the keyed hash, where a one-pass resize would walk the K chain for each B key: K takes the second pass,
+// and every key must be found after the resize. (That it's linear is measured by harness/table-flood/resizekeyed.cpp.)
+TEST_CASE("TableKeyedHashResize")
+{
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, true};
+    ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, true};
+    ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, true};
+    ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
+
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    REQUIRE(L->global->strt.keyedtables);
+
+    // main positions mod 2S: D one at each of [S/2, 3S/4), K S/2 - 1 at 0, B one at each of [3S/2, 7S/4)
+    const uint32_t S = 4096, mask = 2 * S - 1;
+    std::vector<double> D(S / 4), K, B(S / 4);
+    size_t haveD = 0, haveB = 0;
+    for (uint64_t i = 1; K.size() < S / 2 - 1 || haveD < D.size() || haveB < B.size(); i++)
+    {
+        uint64_t bits = (i * 0x9e3779b97f4a7c15ull) >> 12 | 0x3ff0000000000000ull; // a double in [1, 2)
+        uint32_t mp = uint32_t(luaH_keymix(L->global->strt.tablekey, bits)) & mask;
+        double d;
+        memcpy(&d, &bits, sizeof(d));
+        if (mp == 0 && K.size() < S / 2 - 1)
+            K.push_back(d);
+        else if (mp >= S / 2 && mp < 3 * S / 4 && D[mp - S / 2] == 0)
+            D[mp - S / 2] = d, haveD++;
+        else if (mp >= 3 * S / 2 && mp < 7 * S / 4 && B[mp - 3 * S / 2] == 0)
+            B[mp - 3 * S / 2] = d, haveB++;
+    }
+
+    std::vector<double> all = D;
+    all.insert(all.end(), K.begin(), K.end());
+    all.insert(all.end(), B.begin(), B.end());
+    all.push_back(0.5);
+    all.push_back(2.5);
+    all.push_back(3.5);
+
+    lua_createtable(L, 0, 0);
+    const LuaTable* h = static_cast<const LuaTable*>(lua_topointer(L, -1));
+    for (size_t i = 0; i < all.size(); i++)
+    {
+        lua_pushnumber(L, all[i]);
+        lua_pushinteger(L, int(i) + 1);
+        lua_rawset(L, -3);
+        if (i + 1 == all.size() - 3)
+            CHECK_EQ(sizenode(h), int(S));
+    }
+    CHECK_EQ(sizenode(h), int(2 * S));
+
+    for (size_t i = 0; i < all.size(); i++)
+    {
+        lua_pushnumber(L, all[i]);
+        lua_rawget(L, -2);
+        CHECK_EQ(lua_tointeger(L, -1), int(i) + 1);
+        lua_pop(L, 1);
+    }
+
+    luaC_validate(L);
 }
 
 TEST_CASE("Reference")
@@ -8727,6 +9104,9 @@ static std::string getRecordedFastPathCounters(lua_State* L, const char* global)
 
 TEST_CASE("Promotion")
 {
+    // the expected counters are those of the table NAMECALL fast path, which bakes in a method name's hash: a VM that
+    // keys its strings (DFFlag::LuauTableKeyedHash) takes the generic sequence there, which records fewer
+    ScopedFastFlag luauTableKeyedHash{DFFlag::LuauTableKeyedHash, false};
     ScopedFastFlag luauRuntimeFeedback{FFlag::LuauRuntimeFeedback, true};
     ScopedFastFlag luauCodegenRuntimeFeedback{FFlag::LuauCodegenRuntimeFeedback, true};
     ScopedFastFlag luauPromoteProto{FFlag::LuauPromoteProto, true};
