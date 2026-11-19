@@ -294,9 +294,14 @@ SharedCodeGenContext::SharedCodeGenContext(
 
 // Native code bakes in the hashes of the compiling state's string constants (IrTranslation's GET_HASH_NODE_ADDR), so
 // identified modules are kept apart by the state's string hash (stringtable::wordhash, DFFlag::LuauShortStringHash):
-// a partition of the one SharedCodeAllocator, under its one mutex
+// a partition of the one SharedCodeAllocator, under its one mutex. A state with keyed long strings
+// (stringtable::longhash, DFFlag::LuauLongStringHash) bakes in no hash of a long string, so such states share modules
+// with each other, whatever their keys, but not with word-hash states, which do bake them in.
 static uint8_t modulePartition(lua_State* L)
 {
+    if (L->global->strt.longhash)
+        return 2;
+
     return L->global->strt.wordhash ? 1 : 0;
 }
 
@@ -1317,6 +1322,7 @@ template<typename AssemblyBuilder>
     VmEnvironmentInfo envInfo;
     envInfo.hasPcall = L->global->builtinPcall != nullptr;
     envInfo.hasXpcall = L->global->builtinXpcall != nullptr;
+    envInfo.keyedLongStrings = L->global->strt.longhash;
 
     CompilationResult compilationResult;
 
