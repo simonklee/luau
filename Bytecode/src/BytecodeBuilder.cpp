@@ -4,6 +4,7 @@
 #include "Luau/Bytecode.h"
 #include "Luau/BytecodeUtils.h"
 #include "Luau/SmallVector.h"
+#include "Luau/StringHash.h"
 #include "Luau/StringUtils.h"
 
 #include <algorithm>
@@ -1183,6 +1184,11 @@ uint32_t BytecodeBuilder::getStringHash(StringRef key)
     // VM independent in terms of compilation/linking. The resulting string hashes are embedded into bytecode binary and result in a better initial
     // guess for the field hashes which improves performance during initial code execution. We omit the long string processing here for simplicity, as
     // it doesn't really matter on long identifiers.
+    // With DFFlag::LuauShortStringHash, the VM states created with the flag on use Luau::wordHash, so the compiler predicts with it
+    // (see Luau/StringHash.h for compiling and loading under different flag values).
+    if (DFFlag::LuauShortStringHash)
+        return wordHash(key.data, key.length);
+
     const char* str = key.data;
     size_t len = key.length;
 

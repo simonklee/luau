@@ -16,6 +16,7 @@
 using namespace Luau;
 using namespace Luau::Bytecode;
 
+LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
 LUAU_FASTFLAG(LuauCompileReuseLocalRegs)
 
@@ -36,6 +37,10 @@ std::string extractCode(std::string bytecode)
 struct BytecodeCompilerFixture
 {
     BytecodeCompilerFixture() {}
+
+    // The expected dumps show the predicted slots (GETGLOBAL's and GETTABLEKS's C) of luaS_hash, the compiler's hash with
+    // the flag off; ShortStringHashSlots checks the slots with the flag on
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, false};
 
     ParseResult parseCode(std::string_view src, Allocator& allocator, AstNameTable& names)
     {

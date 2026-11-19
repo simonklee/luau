@@ -5,6 +5,8 @@
 #include "lgc.h"
 #include "lmem.h"
 
+#include "Luau/StringHash.h"
+
 #include <string.h>
 
 LUAU_FASTFLAGVARIABLE(LuauSaltedInterningTable)
@@ -45,6 +47,62 @@ unsigned int luaS_hash(const char* str, size_t len)
         h ^= (h << 5) + (h >> 2) + (uint8_t)str[i - 1];
 
     return h;
+}
+
+// The hash with DFFlag::LuauShortStringHash (Luau/StringHash.h, shared with the compiler's predicted slots)
+unsigned int luaS_wordhash(const char* str, size_t len)
+{
+    return Luau::wordHash(str, len);
+}
+
+// Equality of two strings of length len, with word compares for short strings
+static inline bool streq(const char* a, const char* b, size_t len)
+{
+    if (len < 4)
+        return len == 0 || (a[0] == b[0] && a[len >> 1] == b[len >> 1] && a[len - 1] == b[len - 1]);
+
+    if (len <= 8)
+    {
+        uint32_t a0, a1, b0, b1;
+        memcpy(&a0, a, 4);
+        memcpy(&b0, b, 4);
+        memcpy(&a1, a + len - 4, 4);
+        memcpy(&b1, b + len - 4, 4);
+        return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+    }
+
+    if (len <= 32)
+    {
+        uint64_t diff = 0;
+        for (size_t i = 0; i + 8 < len; i += 8)
+        {
+            uint64_t x, y;
+            memcpy(&x, a + i, 8);
+            memcpy(&y, b + i, 8);
+            diff |= x ^ y;
+        }
+
+        uint64_t x, y;
+        memcpy(&x, a + len - 8, 8);
+        memcpy(&y, b + len - 8, 8);
+        return (diff | (x ^ y)) == 0;
+    }
+
+    return memcmp(a, b, len) == 0;
+}
+
+// The VM's hash, chosen when the VM was created; strings already interned keep their hashes
+static inline unsigned int strhash(const stringtable* tb, const char* str, size_t len)
+{
+    if (tb->wordhash)
+        return len < 32 ? Luau::wordHashShort(uint32_t(len), str, len) : Luau::wordHash(str, len);
+
+    return luaS_hash(str, len);
+}
+
+static inline bool strmatch(const stringtable* tb, const TString* el, const char* str, size_t len)
+{
+    return el->len == len && (tb->wordhash ? streq(str, getstr(el), len) : memcmp(str, getstr(el), len) == 0);
 }
 
 static void luaS_rehash(lua_State* L, int newsize, uint32_t saltmult, uint32_t saltadd)
@@ -181,15 +239,15 @@ TString* luaS_bufstart(lua_State* L, size_t size)
 
 TString* luaS_buffinish(lua_State* L, TString* ts)
 {
-    unsigned int h = luaS_hash(ts->data, ts->len);
     stringtable* tb = &L->global->strt;
+    unsigned int h = strhash(tb, ts->data, ts->len);
     unsigned int saltedh = FFlag::LuauSaltedInterningTable ? salthash(h, tb->saltmult, tb->saltadd) : 0;
     int bucket = FFlag::LuauSaltedInterningTable ? int(tobucket(saltedh, tb->hashshift)) : lmod(h, tb->size);
 
     // search if we already have this string in the hash table
     for (TString* el = tb->hash[bucket]; el != NULL; el = el->next)
     {
-        if (el->len == ts->len && memcmp(el->data, ts->data, ts->len) == 0)
+        if (strmatch(tb, el, ts->data, ts->len))
         {
             // string may be dead
             if (isdead(L->global, obj2gco(el)))
@@ -219,12 +277,12 @@ TString* luaS_newlstr(lua_State* L, const char* str, size_t l)
     if (FFlag::LuauSaltedInterningTable)
     {
         global_State* g = L->global;
-        unsigned int h = luaS_hash(str, l);
+        unsigned int h = strhash(&g->strt, str, l);
         unsigned int saltedh = salthash(h, g->strt.saltmult, g->strt.saltadd);
 
         for (TString* el = g->strt.hash[tobucket(saltedh, g->strt.hashshift)]; el != NULL; el = el->next)
         {
-            if (el->len == l && (memcmp(str, getstr(el), l) == 0))
+            if (strmatch(&g->strt, el, str, l))
             {
                 // string may be dead
                 if (isdead(g, obj2gco(el)))
@@ -237,10 +295,10 @@ TString* luaS_newlstr(lua_State* L, const char* str, size_t l)
     }
     else
     {
-        unsigned int h = luaS_hash(str, l);
+        unsigned int h = strhash(&L->global->strt, str, l);
         for (TString* el = L->global->strt.hash[lmod(h, L->global->strt.size)]; el != NULL; el = el->next)
         {
-            if (el->len == l && (memcmp(str, getstr(el), l) == 0))
+            if (strmatch(&L->global->strt, el, str, l))
             {
                 // string may be dead
                 if (isdead(L->global, obj2gco(el)))

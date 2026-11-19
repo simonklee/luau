@@ -91,6 +91,7 @@ LUAU_DYNAMIC_FASTFLAG(LuauOptimizeStringSplit)
 LUAU_DYNAMIC_FASTFLAG(LuauTableSortInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableFindInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableMoveBudget)
+LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 LUAU_DYNAMIC_FASTFLAG(LuauTemplateNilSlots)
 LUAU_DYNAMIC_FASTFLAG(LuauTableForeachInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableFindImprovement)
@@ -397,6 +398,10 @@ static StateRef runConformance(
     lua_pushboolean(L, true);
     lua_setglobal(L, "limitedstack");
 #endif
+
+    // The VM's string hash (DFFlag::LuauShortStringHash when it was created), for scripts that pin string-key order
+    lua_pushboolean(L, L->global->strt.wordhash);
+    lua_setglobal(L, "shortstringhash");
 
     // Extra test-specific setup
     if (setup)
@@ -1415,49 +1420,55 @@ TEST_CASE("Math")
 
 TEST_CASE("Tables")
 {
-    reallocSizeLimit = 0;
+    // string-key order differs between the two string hashes
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, enabled};
 
-    runConformance(
-        "tables.luau",
-        [](lua_State* L)
-        {
-            lua_pushcfunction(
-                L,
-                [](lua_State* L)
-                {
-                    if (lua_type(L, 1) == LUA_TNUMBER)
-                    {
-                        unsigned v = luaL_checkunsigned(L, 1);
-                        lua_pushlightuserdata(L, reinterpret_cast<void*>(uintptr_t(v)));
-                    }
-                    else
-                    {
-                        const void* p = lua_topointer(L, 1);
-                        LUAU_ASSERT(p); // we expect the test call to only pass GC values here
-                        lua_pushlightuserdata(L, const_cast<void*>(p));
-                    }
-                    return 1;
-                },
-                "makelud"
-            );
-            lua_setglobal(L, "makelud");
+        reallocSizeLimit = 0;
 
-            lua_pushcclosurek(
-                L,
-                [](lua_State* L)
-                {
-                    reallocSizeLimit = luaL_checkunsigned(L, 1);
-                    return 0;
-                },
-                "setallocationlimit",
-                0,
-                nullptr
-            );
-            lua_setglobal(L, "setallocationlimit");
-        },
-        nullptr,
-        lua_newstate(limitedRealloc, nullptr)
-    );
+        runConformance(
+            "tables.luau",
+            [](lua_State* L)
+            {
+                lua_pushcfunction(
+                    L,
+                    [](lua_State* L)
+                    {
+                        if (lua_type(L, 1) == LUA_TNUMBER)
+                        {
+                            unsigned v = luaL_checkunsigned(L, 1);
+                            lua_pushlightuserdata(L, reinterpret_cast<void*>(uintptr_t(v)));
+                        }
+                        else
+                        {
+                            const void* p = lua_topointer(L, 1);
+                            LUAU_ASSERT(p); // we expect the test call to only pass GC values here
+                            lua_pushlightuserdata(L, const_cast<void*>(p));
+                        }
+                        return 1;
+                    },
+                    "makelud"
+                );
+                lua_setglobal(L, "makelud");
+
+                lua_pushcclosurek(
+                    L,
+                    [](lua_State* L)
+                    {
+                        reallocSizeLimit = luaL_checkunsigned(L, 1);
+                        return 0;
+                    },
+                    "setallocationlimit",
+                    0,
+                    nullptr
+                );
+                lua_setglobal(L, "setallocationlimit");
+            },
+            nullptr,
+            lua_newstate(limitedRealloc, nullptr)
+        );
+    }
 }
 
 TEST_CASE("PatternMatch")
@@ -2988,19 +2999,215 @@ TEST_CASE("NDebugGetUpValue")
 TEST_CASE("SameHash")
 {
     extern unsigned int luaS_hash(const char* str, size_t len); // internal function, declared in lstring.h - not exposed via lua.h
+    extern unsigned int luaS_wordhash(const char* str, size_t len);
 
     // To keep VM and compiler separate, we duplicate the hash function definition
     // This test validates that the hash function in question returns the same results on basic inputs
     // If this is violated, some code may regress in performance due to hash slot misprediction in inline caches
-    CHECK(luaS_hash("", 0) == Luau::BytecodeBuilder::getStringHash({"", 0}));
-    CHECK(luaS_hash("lua", 3) == Luau::BytecodeBuilder::getStringHash({"lua", 3}));
-    CHECK(luaS_hash("luau", 4) == Luau::BytecodeBuilder::getStringHash({"luau", 4}));
-    CHECK(luaS_hash("luaubytecode", 12) == Luau::BytecodeBuilder::getStringHash({"luaubytecode", 12}));
-    CHECK(luaS_hash("luaubytecodehash", 16) == Luau::BytecodeBuilder::getStringHash({"luaubytecodehash", 16}));
+    {
+        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, false};
+
+        CHECK(luaS_hash("", 0) == Luau::BytecodeBuilder::getStringHash({"", 0}));
+        CHECK(luaS_hash("lua", 3) == Luau::BytecodeBuilder::getStringHash({"lua", 3}));
+        CHECK(luaS_hash("luau", 4) == Luau::BytecodeBuilder::getStringHash({"luau", 4}));
+        CHECK(luaS_hash("luaubytecode", 12) == Luau::BytecodeBuilder::getStringHash({"luaubytecode", 12}));
+        CHECK(luaS_hash("luaubytecodehash", 16) == Luau::BytecodeBuilder::getStringHash({"luaubytecodehash", 16}));
+    }
+
+    // With DFFlag::LuauShortStringHash the compiler predicts with the VM's word hash, at every length
+    {
+        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, true};
+
+        std::string text;
+        for (int i = 0; i < 100; i++)
+            text += char('a' + (i * 7) % 26);
+        for (size_t len = 0; len <= text.size(); len++)
+        {
+            INFO("length " << len);
+            CHECK_EQ(luaS_wordhash(text.data(), len), Luau::BytecodeBuilder::getStringHash({text.data(), len}));
+        }
+    }
 
     // Also hash should work on unaligned source data even when hashing long strings
     char buf[128] = {};
     CHECK(luaS_hash(buf + 1, 120) == luaS_hash(buf + 2, 120));
+}
+
+// The compiler's predicted slots are the slots the VM uses, with the flag off and on: a table constructor's keys sit
+// where BytecodeBuilder::getStringHash puts them, in a VM created under the same flag
+TEST_CASE("ShortStringHashSlots")
+{
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, enabled};
+
+        const char* source = "return {a = 1, b = 2, c = 3, first = 10, second = 20, third = 30, session = 1, title = 2}";
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source, strlen(source), nullptr, &bytecodeSize);
+
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+        REQUIRE(luau_load(L, "=slots", bytecode, bytecodeSize, 0) == 0);
+        free(bytecode);
+        lua_call(L, 0, 1);
+
+        const LuaTable* h = static_cast<const LuaTable*>(lua_topointer(L, -1));
+        int matched = 0;
+        for (int i = 0; i < sizenode(h); i++)
+        {
+            const LuaNode* n = gnode(h, i);
+            if (!ttisstring(gkey(n)))
+                continue;
+
+            const TString* key = tsvalue(gkey(n));
+            unsigned int predicted = Luau::BytecodeBuilder::getStringHash({getstr(key), key->len});
+            INFO("flag " << enabled << ", key " << getstr(key));
+            CHECK_EQ(predicted, key->hash);
+            // a key that isn't in its main position was moved there by a collision; its main position is taken
+            unsigned int mainpos = predicted & (sizenode(h) - 1);
+            if (int(mainpos) == i)
+                matched++;
+            else
+                CHECK(ttisstring(gkey(gnode(h, mainpos))));
+        }
+        CHECK(matched > 0);
+    }
+}
+
+TEST_CASE("ShortStringHash")
+{
+    extern unsigned int luaS_hash(const char* str, size_t len);     // internal, declared in lstring.h
+    extern unsigned int luaS_wordhash(const char* str, size_t len); // internal, declared in lstring.h
+
+    // The hash is defined on bytes (little-endian loads), so these values hold on every platform
+    const char* text = "the quick brown fox jumps over the lazy dog, then the slow red cat naps under the warm sun";
+    const size_t lengths[] = {0, 1, 2, 3, 4, 5, 7, 8, 9, 12, 15, 16, 17, 24, 31, 32, 33, 43, 44, 45, 88}; // the text has 90 bytes
+    const unsigned int expected[] = {
+        0x00000000, 0x113c0ae0, 0x73419430, 0x15a2616b, 0xb9b41326, 0x3db59afd, 0xbdc56a6f, 0xc2b864b0, 0x43af7671, 0xcde54184, 0xad0825ed,
+        0x070ac44e, 0x3769f14c, 0xc656d131, 0x52c43985, 0xfb7144d2, 0x06e67241, 0x5a429272, 0x8a83c64f, 0x41ee5c90, 0x8fa926a5,
+    };
+    static_assert(sizeof(lengths) / sizeof(lengths[0]) == sizeof(expected) / sizeof(expected[0]), "one value per length");
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++)
+    {
+        INFO("length " << lengths[i]);
+        CHECK_EQ(luaS_wordhash(text, lengths[i]), expected[i]);
+    }
+
+    // The same bytes at any alignment
+    char buf[160];
+    for (size_t i = 0; i < sizeof(buf); i++)
+        buf[i] = char(i * 37 + 11);
+    for (size_t len = 0; len < 100; len++)
+    {
+        char a[128], b[136];
+        memcpy(a, buf + 3, len);
+        memcpy(b + 5, buf + 3, len);
+        CHECK_EQ(luaS_wordhash(a, len), luaS_wordhash(b + 5, len));
+    }
+
+    // Every string that differs from a base string in one byte (any value, at any position) gets its own hash, for every
+    // short length. 747's hash collides 3,313 times on these sets.
+    for (size_t len = 1; len < 32; len++)
+    {
+        std::string base;
+        for (size_t i = 0; i < len; i++)
+            base += char('a' + (i * 7 + len) % 26);
+        std::vector<unsigned int> hashes{luaS_wordhash(base.data(), len)};
+        for (size_t pos = 0; pos < len; pos++)
+            for (int c = 0; c < 256; c++)
+                if (char(c) != base[pos])
+                {
+                    std::string s = base;
+                    s[pos] = char(c);
+                    hashes.push_back(luaS_wordhash(s.data(), len));
+                }
+        std::sort(hashes.begin(), hashes.end());
+        INFO("length " << len);
+        CHECK(std::adjacent_find(hashes.begin(), hashes.end()) == hashes.end());
+    }
+
+    // Joux's multicollision against 747's hash, which walks a short string from its end through a 32-bit state: find two
+    // 3-byte blocks that reach the same state, 10 times, giving 2^10 30-byte keys with one 747 hash. The word hash
+    // keeps them apart (no collision, and no table slot with more than 8 of them)
+    {
+        std::vector<std::string> keys{""};
+        uint32_t state = 30;
+        uint32_t seed = 1;
+        for (int stage = 0; stage < 10; stage++)
+        {
+            std::unordered_map<uint32_t, std::string> seen;
+            for (;;)
+            {
+                std::string block;
+                for (int i = 0; i < 3; i++)
+                {
+                    seed = seed * 1103515245 + 12345;
+                    block += char('a' + (seed >> 16) % 26);
+                }
+                uint32_t h = state;
+                for (size_t i = 3; i > 0; --i)
+                    h ^= (h << 5) + (h >> 2) + uint8_t(block[i - 1]);
+                auto it = seen.find(h);
+                if (it != seen.end() && it->second != block)
+                {
+                    std::vector<std::string> next;
+                    for (const std::string& k : keys)
+                    {
+                        next.push_back(it->second + k);
+                        next.push_back(block + k);
+                    }
+                    keys.swap(next);
+                    state = h;
+                    break;
+                }
+                seen[h] = block;
+            }
+        }
+        REQUIRE(keys.size() == 1024);
+
+        std::vector<unsigned int> hashes;
+        std::vector<int> slots(1024);
+        int worst = 0;
+        for (const std::string& k : keys)
+        {
+            CHECK_EQ(luaS_hash(k.data(), k.size()), luaS_hash(keys[0].data(), keys[0].size()));
+            unsigned int h = luaS_wordhash(k.data(), k.size());
+            hashes.push_back(h);
+            worst = std::max(worst, ++slots[h & 1023]);
+        }
+        std::sort(hashes.begin(), hashes.end());
+        CHECK(std::adjacent_find(hashes.begin(), hashes.end()) == hashes.end());
+        CHECK(worst <= 8);
+    }
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, enabled};
+
+        runConformance("shorthash.luau");
+
+        // The VM keeps the hash it was created with: strings interned before the flag changes are still found after
+        StateRef globalState(luaL_newstate(), lua_close);
+        lua_State* L = globalState.get();
+        const char* before = nullptr;
+        {
+            ScopedFastFlag flip{DFFlag::LuauShortStringHash, !enabled};
+            lua_pushstring(L, "interned before");
+            before = lua_tostring(L, -1);
+            CHECK_EQ(L->global->strt.wordhash, enabled);
+        }
+        lua_pushstring(L, "interned before");
+        CHECK(lua_tostring(L, -1) == before);
+        CHECK(lua_rawequal(L, -1, -2));
+        lua_pop(L, 2);
+    }
+
+    // The scripts that iterate string keys, with the flag off (the defaults run them with it on; "Tables" runs both)
+    {
+        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, false};
+        runConformance("basic.luau");
+        runConformance("strings.luau");
+    }
 }
 
 TEST_CASE("Reference")

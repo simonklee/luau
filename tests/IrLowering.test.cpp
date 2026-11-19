@@ -16,6 +16,7 @@
 #include <memory>
 #include <string_view>
 
+LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 LUAU_FASTFLAG(LuauCodegenMarkUsed)
 LUAU_FASTFLAG(DebugLuauBufferVectorFastcalls)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
@@ -8627,22 +8628,19 @@ TEST_CASE_FIXTURE(LoweringFixture, "UserdataDirectNamecall")
 
     assemblyOptions.includeOutlinedCode = true;
 
-    CHECK_EQ(
-        "\n" + getCodegenAssembly(
-                   R"(
-local function foo(a)
-    return a:Foo(1)
-end
-)"
-               ),
-        R"(
+    // GET_HASH_NODE_ADDR takes the hash of the VM that compiles: luaS_hash's with the flag off, luaS_wordhash's with it on
+    for (bool wordHash : {false, true})
+    {
+        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, wordHash};
+
+        std::string expected = R"(
 ; function foo($arg0) line 2
 bb_bytecode_0:
   STORE_DOUBLE R3, 1
   STORE_TAG R3, tnumber
   CHECK_TAG R0, ttable, bb_fallback_5
   %4 = LOAD_POINTER R0
-  %5 = GET_HASH_NODE_ADDR %4, 228911u
+  %5 = GET_HASH_NODE_ADDR %4, )" + std::string(wordHash ? "58532473u" : "228911u") + R"(
   JUMP_SLOT_MATCH %5, K0 ('Foo'), bb_3, bb_4
 bb_3:
   STORE_POINTER R2, %4
@@ -8679,7 +8677,18 @@ bb_fallback_5:
   INTERRUPT 1u
   INVOKE_NAMECALL 1u, R1, R0, 2i, -1i
   JUMP bb_6
+)";
+
+        CHECK_EQ(
+            "\n" + getCodegenAssembly(
+                       R"(
+local function foo(a)
+    return a:Foo(1)
+end
 )"
-    );
+                   ),
+            expected
+        );
+    }
 }
 TEST_SUITE_END();
