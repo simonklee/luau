@@ -1185,4 +1185,25 @@ do
   assert(i == -2^31 and v == "x")
 end
 
+-- method calls on tables of many sizes and keys: whatever the string hash puts in a method's main position, a method
+-- the table holds (also out of its main position) is its own, one set to nil falls back to __index, and one it lacks
+-- comes from __index, also when its main position holds other keys
+do
+  local class = {}
+  class.__index = class
+  function class.m(self) return "inherited" end
+  local function own(self) return "own" end
+  for n = 0, 40 do
+    for variant = 1, 3 do
+      local t = setmetatable({}, class)
+      for i = 1, n do t["k" .. i .. "_" .. variant] = i end
+      if variant == 2 then t.m = own end
+      if variant == 3 then t.m = own; t["late" .. n] = true; t.m = nil end
+      for _ = 1, 3 do
+        assert(t:m() == (if variant == 2 then "own" else "inherited"))
+      end
+    end
+  end
+end
+
 return "OK"
