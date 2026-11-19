@@ -4490,6 +4490,97 @@ TEST_CASE("ApiIterPeekNoCallback")
     luaC_validate(L);
 }
 
+// lua_tableslots against what lua_rawiter scans: starting at any iter below the count scans that slot (a live slot
+// returns iter + 1), and starting at the count or past it returns -1 at once. Returns the count.
+static int checkTableSlots(lua_State* L, int idx)
+{
+    idx = lua_absindex(L, idx);
+    int slots = lua_tableslots(L, idx);
+    const LuaTable* h = (const LuaTable*)lua_topointer(L, idx);
+    CHECK(slots == h->sizearray + (1 << h->lsizenode));
+
+    int pairs = 0;
+    for (int iter = 0; (iter = lua_rawiter(L, idx, iter)) >= 0;)
+    {
+        lua_pop(L, 2);
+        CHECK(iter <= slots);
+        pairs++;
+    }
+
+    int live = 0;
+    for (int iter = 0; iter < slots; iter++)
+    {
+        int next = lua_rawiter(L, idx, iter);
+        if (next >= 0)
+            lua_pop(L, 2);
+        CHECK((next < 0 || next > iter));
+        live += next == iter + 1;
+    }
+    CHECK(live == pairs);
+    CHECK(lua_rawiter(L, idx, slots) == -1);
+    CHECK(lua_rawiter(L, idx, slots + 1) == -1);
+    return slots;
+}
+
+TEST_CASE("ApiTableSlots")
+{
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    luaL_openlibs(L);
+
+    struct
+    {
+        const char* source;
+        int slots;
+    } tables[] = {
+        // no hash part: the one shared empty node counts, as lua_rawiter scans it
+        {"return {}", 1},
+        {"return {1, 2, 3, 4}", 5},
+        {"return table.create(100)", 101},
+        {"return table.create(100, true)", 101},
+        {"local t = table.create(8) t[8] = 'h' return t", 9},
+        // hash only
+        {"return {a = 1, b = 2, c = 3, d = 4}", 4},
+        {"return {a = 1, b = 2, c = 3}", 4},
+        // both parts, every slot live: the last iter is the count
+        {"return {1, 2, 3, 4, a = 1, b = 2, c = 3, d = 4}", 8},
+        // grown by assignment: 100 elements need an array of 128
+        {"local t = {} for i = 1, 100 do t[i] = i end return t", 129},
+        {"local t = {} for i = 1, 100 do t['k' .. i] = i end return t", 128},
+        // shrunk: an integer key's rehash counts only the live keys, so the array part shrinks to 2 and 1000 goes to the
+        // hash part
+        {"local t = {} for i = 1, 100 do t[i] = i end for i = 3, 100 do t[i] = nil end t[1000] = 1 return t", 3},
+    };
+
+    for (const auto& table : tables)
+    {
+        CAPTURE(table.source);
+        pushChunkResult(L, table.source);
+        CHECK(checkTableSlots(L, -1) == table.slots);
+        lua_pop(L, 1);
+    }
+
+    // a weak table with 's' in its __mode shrinks its hash part in the GC
+    pushChunkResult(L, "local t = setmetatable({}, {__mode = 'vs'}) for i = 1, 100 do t['k' .. i] = {} end t.keep = 1 return t");
+    CHECK(checkTableSlots(L, -1) == 128);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    CHECK(checkTableSlots(L, -1) == 1);
+    lua_pop(L, 1);
+
+    // every slot live: a full walk ends at the count
+    pushChunkResult(L, "return {1, 2, 3, 4, a = 1, b = 2, c = 3, d = 4}");
+    {
+        int iter = 0, last = 0;
+        while ((iter = lua_rawiter(L, -1, iter)) >= 0)
+        {
+            lua_pop(L, 2);
+            last = iter;
+        }
+        CHECK(last == lua_tableslots(L, -1));
+    }
+    lua_pop(L, 1);
+}
+
 static int cpcallTest(lua_State* L)
 {
     bool shouldFail = *(bool*)(lua_tolightuserdata(L, 1));
