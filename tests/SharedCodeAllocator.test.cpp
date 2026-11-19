@@ -22,6 +22,7 @@
 #endif
 
 LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
+LUAU_DYNAMIC_FASTFLAG(LuauLongStringHash)
 
 using namespace Luau::CodeGen;
 
@@ -501,102 +502,108 @@ TEST_CASE("SharedAllocation")
 
 // Native code bakes in the compiling VM's string hashes (a method name's main slot), so a module compiled in a VM with
 // one string hash (DFFlag::LuauShortStringHash, read when the VM is created) must not be bound in a VM with the other:
-// there, `t:Foo()` would probe the wrong slot, find it empty and take `Foo` from `__index`.
+// there, `t:Foo()` would probe the wrong slot, find it empty and take `Foo` from `__index`. With DFFlag::LuauLongStringHash
+// each VM hashes a name of 32 bytes or more with its own key, so its native code bakes in no such hash.
 TEST_CASE("SharedAllocationMixedStringHash")
 {
     if (!luau_codegen_supported())
         return;
 
-    std::string source = R"(
-        return function(t) return t:Foo() end
-    )";
-
-    size_t bytecodeSize = 0;
-    std::unique_ptr<char[], void (*)(void*)> bytecode{luau_compile(source.data(), source.size(), nullptr, &bytecodeSize), free};
-
-    auto newState = [](bool wordHash)
+    // 0: 747's hash; 1: the word hash; 2: the word hash with keyed long strings
+    auto newState = [](int mode)
     {
-        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, wordHash};
+        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, mode >= 1};
+        ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, mode >= 2};
         return std::unique_ptr<lua_State, void (*)(lua_State*)>{luaL_newstate(), lua_close};
     };
 
-    // Loads the chunk, compiles it under the shared module id and returns how many functions were compiled; leaves
-    // the chunk's function on the stack
-    auto load = [&](lua_State* L)
+    for (std::string method : {"Foo", "AMethodNameOfThirtyTwoBytesOrMore"})
     {
-        REQUIRE(luau_load(L, "=Method", bytecode.get(), bytecodeSize, 0) == 0);
+        std::string source = "return function(t) return t:" + method + "() end";
 
-        CompilationOptions options;
-        options.flags = CodeGen_ColdFunctions;
-        CompilationStats stats = {};
-        const ModuleId moduleId = {0x02};
-        REQUIRE(Luau::CodeGen::compile(moduleId, L, -1, options, &stats).result == CodeGenCompilationResult::Success);
-        REQUIRE(stats.functionsBound == 2);
+        size_t bytecodeSize = 0;
+        std::unique_ptr<char[], void (*)(void*)> bytecode{luau_compile(source.data(), source.size(), nullptr, &bytecodeSize), free};
 
-        lua_call(L, 0, 1);
-        return stats.functionsCompiled;
-    };
-
-    // A table of 4 nodes holding only Foo, whose __index also has a Foo: the call must reach the table's own
-    auto call = [](lua_State* L)
-    {
-        lua_pushvalue(L, -1);
-        lua_createtable(L, 0, 4);
-        lua_pushcfunction(
-            L,
-            [](lua_State* L)
-            {
-                lua_pushstring(L, "receiver");
-                return 1;
-            },
-            "receiver"
-        );
-        lua_setfield(L, -2, "Foo");
-
-        lua_createtable(L, 0, 1);
-        lua_createtable(L, 0, 1);
-        lua_pushcfunction(
-            L,
-            [](lua_State* L)
-            {
-                lua_pushstring(L, "inherited");
-                return 1;
-            },
-            "inherited"
-        );
-        lua_setfield(L, -2, "Foo");
-        lua_setfield(L, -2, "__index");
-        lua_setmetatable(L, -2);
-
-        lua_call(L, 1, 1);
-        std::string result = lua_tostring(L, -1);
-        lua_pop(L, 1);
-        return result;
-    };
-
-    for (bool firstWordHash : {false, true})
-    {
-        for (bool secondWordHash : {false, true})
+        // Loads the chunk, compiles it under the shared module id and returns how many functions were compiled; leaves
+        // the chunk's function on the stack
+        auto load = [&](lua_State* L)
         {
-            INFO("first VM word hash " << firstWordHash << ", second " << secondWordHash);
+            REQUIRE(luau_load(L, "=Method", bytecode.get(), bytecodeSize, 0) == 0);
 
-            UniqueSharedCodeGenContext sharedCodeGenContext = createSharedCodeGenContext();
-            auto L1 = newState(firstWordHash);
-            auto L2 = newState(secondWordHash);
-            create(L1.get(), sharedCodeGenContext.get());
-            create(L2.get(), sharedCodeGenContext.get());
+            CompilationOptions options;
+            options.flags = CodeGen_ColdFunctions;
+            CompilationStats stats = {};
+            const ModuleId moduleId = {0x02};
+            REQUIRE(Luau::CodeGen::compile(moduleId, L, -1, options, &stats).result == CodeGenCompilationResult::Success);
+            REQUIRE(stats.functionsBound == 2);
 
-            CHECK(load(L1.get()) == 2);
-            // the second VM reuses the module only if it hashes strings the same way
-            CHECK(load(L2.get()) == (firstWordHash == secondWordHash ? 0u : 2u));
+            lua_call(L, 0, 1);
+            return stats.functionsCompiled;
+        };
 
-            CHECK(call(L1.get()) == "receiver");
-            CHECK(call(L2.get()) == "receiver");
+        // A table of 64 nodes holding only the method, whose __index also has it: the call must reach the table's own
+        auto call = [&](lua_State* L)
+        {
+            lua_pushvalue(L, -1);
+            lua_createtable(L, 0, 64);
+            lua_pushcfunction(
+                L,
+                [](lua_State* L)
+                {
+                    lua_pushstring(L, "receiver");
+                    return 1;
+                },
+                "receiver"
+            );
+            lua_setfield(L, -2, method.c_str());
+
+            lua_createtable(L, 0, 1);
+            lua_createtable(L, 0, 1);
+            lua_pushcfunction(
+                L,
+                [](lua_State* L)
+                {
+                    lua_pushstring(L, "inherited");
+                    return 1;
+                },
+                "inherited"
+            );
+            lua_setfield(L, -2, method.c_str());
+            lua_setfield(L, -2, "__index");
+            lua_setmetatable(L, -2);
+
+            lua_call(L, 1, 1);
+            std::string result = lua_tostring(L, -1);
+            lua_pop(L, 1);
+            return result;
+        };
+
+        for (int firstMode : {0, 1, 2})
+        {
+            for (int secondMode : {0, 1, 2})
+            {
+                INFO("method " << method << ", first VM's hash " << firstMode << ", second " << secondMode);
+
+                UniqueSharedCodeGenContext sharedCodeGenContext = createSharedCodeGenContext();
+                auto L1 = newState(firstMode);
+                auto L2 = newState(secondMode);
+                create(L1.get(), sharedCodeGenContext.get());
+                create(L2.get(), sharedCodeGenContext.get());
+
+                CHECK(load(L1.get()) == 2);
+                // the second VM reuses the module only if it hashes strings the same way (two VMs with keyed long strings
+                // have different keys, and share modules all the same)
+                CHECK(load(L2.get()) == (firstMode == secondMode ? 0u : 2u));
+
+                CHECK(call(L1.get()) == "receiver");
+                CHECK(call(L2.get()) == "receiver");
+            }
         }
     }
 }
 
-// VMs of both string hashes compiling, running and releasing modules in one shared context at once. Both partitions
+// VMs of all three string hashes (747's, the word hash, the word hash with keyed long strings) compiling, running and
+// releasing modules in one shared context at once, with a short and a long method name. All partitions
 // share one SharedCodeAllocator, so allocation and release in the CodeAllocator happen under its one mutex. A data race
 // here shows up under ThreadSanitizer (make config=tsan CXX="clang++ -fsanitize=thread"), not as a failed check.
 TEST_CASE("SharedAllocationMixedStringHashThreads")
@@ -604,12 +611,16 @@ TEST_CASE("SharedAllocationMixedStringHashThreads")
     if (!luau_codegen_supported())
         return;
 
-    std::string source = R"(
-        return function(t) return t:Foo() end
-    )";
-
-    size_t bytecodeSize = 0;
-    std::unique_ptr<char[], void (*)(void*)> bytecode{luau_compile(source.data(), source.size(), nullptr, &bytecodeSize), free};
+    const char* methods[] = {"Foo", "AMethodNameOfThirtyTwoBytesOrMore"};
+    std::vector<std::string> bytecodes;
+    for (const char* method : methods)
+    {
+        std::string source = std::string("return function(t) return t:") + method + "() end";
+        size_t bytecodeSize = 0;
+        char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
+        bytecodes.emplace_back(bytecode, bytecodeSize);
+        free(bytecode);
+    }
 
     UniqueSharedCodeGenContext sharedCodeGenContext = createSharedCodeGenContext();
 
@@ -630,18 +641,21 @@ TEST_CASE("SharedAllocationMixedStringHashThreads")
                         // VMs are made on one thread at a time: the flag is a global
                         static std::mutex flagMutex;
                         std::unique_lock lock{flagMutex};
-                        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, (t + round) % 2 == 0};
+                        int mode = (t + round) % 3;
+                        ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, mode >= 1};
+                        ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, mode >= 2};
                         L = luaL_newstate();
                         create(L, sharedCodeGenContext.get());
                     }
 
-                    if (luau_load(L, "=Method", bytecode.get(), bytecodeSize, 0) != 0)
+                    int which = (t / 2 + round) % 2;
+                    if (luau_load(L, "=Method", bytecodes[which].data(), bytecodes[which].size(), 0) != 0)
                         failures++;
 
                     CompilationOptions options;
                     options.flags = CodeGen_ColdFunctions;
-                    // a few ids, so threads both insert and reuse modules, in both partitions
-                    const ModuleId moduleId = {uint8_t(0x10 + round % 3)};
+                    // a few ids for each source, so threads both insert and reuse modules, in every partition
+                    const ModuleId moduleId = {uint8_t(0x10 + 0x10 * which + round % 3)};
                     if (Luau::CodeGen::compile(moduleId, L, -1, options).result != CodeGenCompilationResult::Success)
                         failures++;
 
@@ -656,7 +670,7 @@ TEST_CASE("SharedAllocationMixedStringHashThreads")
                         },
                         "receiver"
                     );
-                    lua_setfield(L, -2, "Foo");
+                    lua_setfield(L, -2, methods[which]);
                     lua_call(L, 1, 1);
                     if (strcmp(lua_tostring(L, -1), "receiver") != 0)
                         failures++;

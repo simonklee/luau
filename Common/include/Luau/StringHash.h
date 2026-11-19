@@ -16,6 +16,10 @@
 // predicted slots miss on first use, and the VM patches each instruction on its first miss.
 LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 
+// With DFFlag::LuauLongStringHash (and DFFlag::LuauShortStringHash), each VM hashes a string of 32 bytes or more with
+// its own key (luaS_longhash), which the compiler can't know: its predicted slots for such strings miss once.
+LUAU_DYNAMIC_FASTFLAG(LuauLongStringHash)
+
 namespace Luau
 {
 
@@ -28,6 +32,13 @@ inline uint32_t loadLe32(const char* p)
     v = (v >> 24) | ((v >> 8) & 0xff00) | ((v << 8) & 0xff0000) | (v << 24);
 #endif
     return v;
+}
+
+// Whether a VM created with the current flags hashes a string of this length with its own key, so that no hash the
+// compiler computes predicts its slot
+inline bool isStringHashKeyed(size_t len)
+{
+    return DFFlag::LuauShortStringHash && DFFlag::LuauLongStringHash && len >= 32;
 }
 
 // Hashes up to 31 bytes 4 at a time into a 64-bit state. Each step takes 32 bits, spread over the state by a

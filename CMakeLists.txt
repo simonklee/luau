@@ -135,6 +135,10 @@ target_link_libraries(Luau.CodeGen PUBLIC Luau.Common)
 target_compile_features(Luau.VM PRIVATE cxx_std_11)
 target_include_directories(Luau.VM PUBLIC VM/include)
 target_link_libraries(Luau.VM PUBLIC Luau.Common)
+if(MINGW)
+    # BCryptGenRandom (lstring.cpp); MSVC links it from a pragma, MinGW ignores the pragma
+    target_link_libraries(Luau.VM PRIVATE bcrypt)
+endif()
 
 target_compile_features(Luau.Require PUBLIC cxx_std_17)
 target_include_directories(Luau.Require PUBLIC Require/include)

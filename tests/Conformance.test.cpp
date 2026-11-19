@@ -19,6 +19,7 @@
 #include "Luau/BytecodeSummary.h"
 #include "Luau/BytecodeDump.h"
 #include "Luau/Parser.h"
+#include "Luau/StringHash.h"
 #include "Luau/StringUtils.h"
 
 #include "doctest.h"
@@ -92,6 +93,9 @@ LUAU_DYNAMIC_FASTFLAG(LuauTableSortInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableFindInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableMoveBudget)
 LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
+LUAU_DYNAMIC_FASTFLAG(LuauLongStringHash)
+LUAU_DYNAMIC_FASTINT(LuauStringHashSeed)
+LUAU_FASTFLAG(LuauSaltedInterningTable)
 LUAU_DYNAMIC_FASTFLAG(LuauTemplateNilSlots)
 LUAU_DYNAMIC_FASTFLAG(LuauTableForeachInterrupt)
 LUAU_DYNAMIC_FASTFLAG(LuauTableFindImprovement)
@@ -362,7 +366,12 @@ static StateRef runConformance(
     stream.close();
 
     if (!initialLuaState)
+    {
+        // A fixed string hash seed unless the test set one, so that iteration order over long string keys is the same in
+        // every run (lua.h, lua_newstate)
+        ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, DFInt::LuauStringHashSeed ? DFInt::LuauStringHashSeed.value : 1};
         initialLuaState = luaL_newstate();
+    }
     StateRef globalState(initialLuaState, lua_close);
     lua_State* L = globalState.get();
 
@@ -3206,6 +3215,291 @@ TEST_CASE("ShortStringHash")
     {
         ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, false};
         runConformance("basic.luau");
+        runConformance("strings.luau");
+    }
+}
+
+// The longest chain of the VM's interning table
+static int longestStringChain(lua_State* L)
+{
+    const stringtable& tb = L->global->strt;
+    int worst = 0;
+    for (int i = 0; i < tb.size; i++)
+    {
+        int n = 0;
+        for (const TString* p = tb.hash[i]; p; p = p->next)
+            n++;
+        worst = std::max(worst, n);
+    }
+    return worst;
+}
+
+// Interns each key in a new VM, keeping them all alive in a table, and returns the VM
+static StateRef internAll(const std::vector<std::string>& keys)
+{
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+    lua_createtable(L, int(keys.size()), 0);
+    for (size_t i = 0; i < keys.size(); i++)
+    {
+        lua_pushlstring(L, keys[i].data(), keys[i].size());
+        lua_rawseti(L, -2, int(i + 1));
+    }
+    return globalState;
+}
+
+TEST_CASE("LongStringHash")
+{
+    extern unsigned int luaS_hash(const char* str, size_t len);                            // internal, declared in lstring.h
+    extern unsigned int luaS_longhash(const uint64_t key[2], const char* str, size_t len); // internal, declared in lstring.h
+
+    // SipHash-1-3 folded to 32 bits, key 00..0f, message 00 01 02 ...; checked against a reference SipHash written from
+    // the paper, itself checked against SipHash-2-4's published vector
+    {
+        const uint64_t key[2] = {0x0706050403020100ull, 0x0f0e0d0c0b0a0908ull};
+        char msg[256];
+        for (int i = 0; i < 256; i++)
+            msg[i] = char(i);
+        const size_t lengths[] = {32, 33, 39, 40, 47, 63, 64, 100, 255};
+        const unsigned int expected[] = {0x97b2cd61, 0x37db405a, 0x197bd4c6, 0x58362303, 0xc2aa0261, 0x2aa223ca, 0xba33f789, 0x37427bf9, 0xe25e5ef6};
+        static_assert(sizeof(lengths) / sizeof(lengths[0]) == sizeof(expected) / sizeof(expected[0]), "one value per length");
+        for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++)
+        {
+            INFO("length " << lengths[i]);
+            CHECK_EQ(luaS_longhash(key, msg, lengths[i]), expected[i]);
+        }
+    }
+
+    // A 32 or 33 byte string's unkeyed hash (Luau::wordHash) mixes its first 12 bytes into 32 bits, which a chosen first
+    // 8 bytes can hold constant: for any x, the block (x, y, 0) with y as below leaves the state at the length. 2^32
+    // strings with one hash, at 4 operations each.
+    auto mixPreimages = [](size_t len, int count)
+    {
+        auto rot = [](uint32_t x, int s)
+        {
+            return (x >> s) | (x << (32 - s));
+        };
+        uint32_t h0 = uint32_t(len);
+        std::vector<std::string> keys;
+        for (uint32_t x = 1; keys.size() < size_t(count); x++)
+        {
+            uint32_t a = (x ^ h0) - rot(h0, 14);
+            uint32_t y = rot(a, 11) ^ a;
+            std::string key(len, '-');
+            for (int i = 0; i < 4; i++)
+            {
+                key[i] = char(x >> (8 * i));
+                key[4 + i] = char(y >> (8 * i));
+                key[8 + i] = 0;
+            }
+            keys.push_back(key);
+        }
+        return keys;
+    };
+
+    // Short strings whose unkeyed hash has 13 low zero bits: 2^13 tries each, done before a plugin ships, and they share
+    // a bucket of an unsalted interning table of up to 8192 buckets
+    std::vector<std::string> lowBits;
+    for (uint64_t i = 0; lowBits.size() < 1024; i++)
+    {
+        char key[8];
+        memcpy(key, &i, 8);
+        if ((Luau::wordHashShort(8, key, 8) & 8191) == 0)
+            lowBits.push_back(std::string(key, 8));
+    }
+
+    // Below: the word hash with keyed long strings. Where a result depends on the key, the seed is fixed
+    // (DFInt::LuauStringHashSeed), so that the bounds and comparisons are exact results, not chances.
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, true};
+
+    for (size_t len : {32, 33})
+    {
+        std::vector<std::string> keys = mixPreimages(len, 4096);
+        for (const std::string& k : keys)
+            REQUIRE_EQ(Luau::wordHash(k.data(), k.size()), Luau::wordHash(keys[0].data(), keys[0].size()));
+
+        for (bool enabled : {false, true})
+        {
+            ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, enabled};
+            ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
+            StateRef globalState = internAll(keys);
+            INFO("length " << len << ", flag " << enabled);
+            if (enabled)
+                CHECK(longestStringChain(globalState.get()) <= 16);
+            else
+                CHECK(longestStringChain(globalState.get()) >= 4096);
+        }
+    }
+
+    for (bool enabled : {false, true})
+    {
+        ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, enabled};
+        ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
+        StateRef globalState = internAll(lowBits);
+        INFO("flag " << enabled);
+        if (enabled)
+            CHECK(longestStringChain(globalState.get()) <= 16);
+        else if (!FFlag::LuauSaltedInterningTable) // its default salt, a known multiplier, takes the top bits
+            CHECK(longestStringChain(globalState.get()) >= 1024);
+    }
+
+    ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, true};
+    const char* text = "a string of thirty-two bytes or more, hashed with each VM's key";
+    auto hashOf = [](lua_State* L, const char* str)
+    {
+        lua_pushstring(L, str);
+        unsigned int h = tsvalue(L->top - 1)->hash;
+        lua_pop(L, 1);
+        return h;
+    };
+    // The values of a table with eight long keys, in iteration order
+    auto order = [](lua_State* L)
+    {
+        lua_createtable(L, 0, 8);
+        for (int i = 0; i < 8; i++)
+        {
+            std::string key = std::string(31, 'k') + char('A' + i);
+            lua_pushinteger(L, i + 1);
+            lua_setfield(L, -2, key.c_str());
+        }
+        std::string values;
+        lua_pushnil(L);
+        while (lua_next(L, -2))
+        {
+            values += char('0' + lua_tointeger(L, -1));
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+        return values;
+    };
+
+    // A fixed seed gives every state the same key and salt (these, from the seed alone) and the same iteration order
+    {
+        ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
+        StateRef first(luaL_newstate(), lua_close);
+        StateRef second(luaL_newstate(), lua_close);
+        const stringtable& a = first->global->strt;
+        const stringtable& b = second->global->strt;
+        REQUIRE(a.longhash);
+        // checked against a reference SipHash (harness long-hash/sipref.cpp)
+        CHECK_EQ(a.longkey[0], 6750596701783250280ull);
+        CHECK_EQ(a.longkey[1], 17107570729802705095ull);
+        CHECK_EQ(a.saltmult, 2987818399u);
+        CHECK_EQ(a.saltadd, 4098975056u);
+        CHECK((a.longkey[0] == b.longkey[0] && a.longkey[1] == b.longkey[1] && a.saltmult == b.saltmult && a.saltadd == b.saltadd));
+        CHECK_EQ(hashOf(first.get(), text), luaS_longhash(a.longkey, text, strlen(text)));
+        CHECK_EQ(hashOf(second.get(), text), hashOf(first.get(), text));
+        CHECK_EQ(order(first.get()), order(second.get()));
+
+        // The hashes a fixed seed gives, the same on every platform (the seed and the strings are read as little-endian
+        // bytes); from the same reference SipHash
+        const char* strings[] = {
+            "an_ordinary_field_name_of_32_bytes_A",
+            "a string of thirty-two bytes or more, hashed with each VM's key",
+            "0123456789abcdef0123456789abcdef",
+            "https://example.com/api/v1/session/12345/message"
+        };
+        const unsigned int expected[] = {0x86f7a412, 0x9a2938b0, 0x00c36dd9, 0xdabc9707};
+        for (int i = 0; i < 4; i++)
+        {
+            INFO(strings[i]);
+            CHECK_EQ(hashOf(first.get(), strings[i]), expected[i]);
+        }
+
+        // another seed, another key: a known result for these two seeds, not a chance
+        ScopedFastInt otherSeed{DFInt::LuauStringHashSeed, 2};
+        StateRef third(luaL_newstate(), lua_close);
+        const stringtable& c = third->global->strt;
+        CHECK((c.longkey[0] != a.longkey[0] || c.longkey[1] != a.longkey[1]));
+        CHECK_EQ(hashOf(third.get(), text), luaS_longhash(c.longkey, text, strlen(text)));
+        CHECK(hashOf(third.get(), text) != hashOf(first.get(), text));
+    }
+
+    // Seed 0, the default: each state draws its own key, hashes with it, and keeps it (and its hash) when the flag changes
+    {
+        ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 0};
+        StateRef first(luaL_newstate(), lua_close);
+        StateRef second(luaL_newstate(), lua_close);
+        const stringtable& a = first->global->strt;
+        const stringtable& b = second->global->strt;
+        CHECK(a.longhash);
+        CHECK((a.longkey[0] != b.longkey[0] || a.longkey[1] != b.longkey[1])); // 128 random bits each
+        CHECK_EQ(hashOf(first.get(), text), luaS_longhash(a.longkey, text, strlen(text)));
+        CHECK_EQ(hashOf(second.get(), text), luaS_longhash(b.longkey, text, strlen(text)));
+
+        lua_pushstring(first.get(), text);
+        ScopedFastFlag flip{DFFlag::LuauLongStringHash, false};
+        lua_pushstring(first.get(), text);
+        CHECK(lua_rawequal(first.get(), -1, -2));
+        CHECK(a.longhash);
+    }
+
+    // Without the short-string word hash the long flag does nothing: the state keeps 747's unkeyed hash
+    {
+        ScopedFastFlag noWordHash{DFFlag::LuauShortStringHash, false};
+        StateRef globalState(luaL_newstate(), lua_close);
+        CHECK(!globalState->global->strt.wordhash);
+        CHECK(!globalState->global->strt.longhash);
+        CHECK_EQ(hashOf(globalState.get(), text), luaS_hash(text, strlen(text)));
+    }
+
+    // A host's pointer encoding key salts the table again, with the host's salt under the state's own key: two states
+    // given one host key keep different salts, and every string is still found
+    {
+        std::vector<std::string> keys = mixPreimages(40, 2000);
+        keys.insert(keys.end(), lowBits.begin(), lowBits.end());
+        ScopedFastInt luauStringHashSeed{DFInt::LuauStringHashSeed, 1};
+        StateRef globalState = internAll(keys);
+        lua_State* L = globalState.get();
+        ScopedFastInt otherSeed{DFInt::LuauStringHashSeed, 2};
+        StateRef other(luaL_newstate(), lua_close);
+
+        uint32_t saltmult = L->global->strt.saltmult;
+        lua_setpointerencodekey(L, 0x1234, 0x5678, 0x9abc, 0xdef0);
+        lua_setpointerencodekey(other.get(), 0x1234, 0x5678, 0x9abc, 0xdef0);
+        const stringtable& a = L->global->strt;
+        const stringtable& b = other->global->strt;
+        CHECK(a.saltmult != saltmult);
+        CHECK_EQ(a.saltmult, 2628046047u);
+        CHECK_EQ(a.saltadd, 1788348080u);
+        CHECK((a.saltmult != b.saltmult || a.saltadd != b.saltadd));
+        CHECK(longestStringChain(L) <= 16);
+        for (size_t i = 0; i < keys.size(); i++)
+        {
+            lua_rawgeti(L, -1, int(i + 1));
+            lua_pushlstring(L, keys[i].data(), keys[i].size());
+            CHECK(lua_tostring(L, -1) == lua_tostring(L, -2));
+            lua_pop(L, 2);
+        }
+    }
+
+    // A table of one bucket (LUA_MINSTRTABSIZE may be 1): the salted bucket's shift is 32, done in 64 bits
+    {
+        extern void luaS_resize(lua_State * L, int newsize); // internal, declared in lstring.h
+
+        std::vector<std::string> keys = mixPreimages(40, 50);
+        keys.insert(keys.end(), lowBits.begin(), lowBits.begin() + 50);
+        StateRef globalState = internAll(keys);
+        lua_State* L = globalState.get();
+        luaS_resize(L, 1);
+        REQUIRE_EQ(L->global->strt.size, 1);
+        CHECK_EQ(L->global->strt.hashshift, 32);
+        for (size_t i = 0; i < keys.size(); i++)
+        {
+            lua_rawgeti(L, -1, int(i + 1));
+            lua_pushlstring(L, keys[i].data(), keys[i].size());
+            CHECK(lua_tostring(L, -1) == lua_tostring(L, -2));
+            lua_pop(L, 2);
+        }
+        lua_pushstring(L, "a new string grows the table");
+        CHECK(L->global->strt.size > 1);
+        lua_pop(L, 1);
+    }
+
+    // The scripts that intern and iterate strings, with the flag off (the defaults run them with it on)
+    {
+        ScopedFastFlag longOff{DFFlag::LuauLongStringHash, false};
+        runConformance("shorthash.luau");
         runConformance("strings.luau");
     }
 }

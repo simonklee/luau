@@ -24,6 +24,7 @@ LUAU_FASTINT(LuauCompileLoopUnrollThreshold)
 LUAU_FASTINT(LuauCompileLoopUnrollThresholdMaxBoost)
 LUAU_FASTINT(LuauRecursionLimit)
 LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
+LUAU_DYNAMIC_FASTFLAG(LuauLongStringHash)
 LUAU_FASTFLAG(LuauCompileTableFoldFix)
 LUAU_FASTFLAG(LuauCompileNoDebugConst)
 LUAU_FASTFLAG(LuauCompileConcatTargetTop)
@@ -962,6 +963,66 @@ DUPTABLE R2 16
 RETURN R0 3
 )"
     );
+}
+
+// With DFFlag::LuauLongStringHash each VM hashes a key of 32 bytes or more with its own key, so the dump shows no slot
+// for it, and no conflicts in its table; the short keys' slots are the word hash's
+TEST_CASE("DumpConstantsTablesKeyed")
+{
+    ScopedFastFlag luauShortStringHash{DFFlag::LuauShortStringHash, true};
+
+    for (bool keyed : {false, true})
+    {
+        ScopedFastFlag luauLongStringHash{DFFlag::LuauLongStringHash, keyed};
+        INFO("keyed " << keyed);
+        CHECK_EQ(
+            "\n" + compileFunction0Constants(R"(
+return {a=1, an_ordinary_field_name_of_32_bytes_A=2, an_ordinary_field_name_of_32_bytes_B=3, b=4}, {first=10, second=20, third=30}
+)"),
+            keyed ? R"(
+K0: 'a'
+K1: 1
+K2: 'an_ordinary_field_name_of_32_byt'...
+K3: 2
+K4: 'an_ordinary_field_name_of_32_byt'...
+K5: 3
+K6: 'b'
+K7: 4
+K8: {['a'] = 1 #1, ['an_ordinary_field_name_of_32_byt'...] = 2 #?, ['an_ordinary_field_name_of_32_byt'...] = 3 #?, ['b'] = 4 #2} sizenode=4
+K9: 'first'
+K10: 10
+K11: 'second'
+K12: 20
+K13: 'third'
+K14: 30
+K15: {['first'] = 10 #3, ['second'] = 20 #1, ['third'] = 30 #0} sizenode=4
+DUPTABLE R0 8
+DUPTABLE R1 15
+RETURN R0 2
+)"
+                  : R"(
+K0: 'a'
+K1: 1
+K2: 'an_ordinary_field_name_of_32_byt'...
+K3: 2
+K4: 'an_ordinary_field_name_of_32_byt'...
+K5: 3
+K6: 'b'
+K7: 4
+K8: {['a'] = 1 #1, ['an_ordinary_field_name_of_32_byt'...] = 2 #3, ['an_ordinary_field_name_of_32_byt'...] = 3 #1 (conflict), ['b'] = 4 #2} sizenode=4
+K9: 'first'
+K10: 10
+K11: 'second'
+K12: 20
+K13: 'third'
+K14: 30
+K15: {['first'] = 10 #3, ['second'] = 20 #1, ['third'] = 30 #0} sizenode=4
+DUPTABLE R0 8
+DUPTABLE R1 15
+RETURN R0 2
+)"
+        );
+    }
 }
 
 TEST_CASE("DumpConstantClass")

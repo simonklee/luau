@@ -2394,12 +2394,24 @@ void BytecodeBuilder::dumpConstant(std::string& result, int k, bool detailed) co
             std::vector<unsigned> slotOwner;
             slotOwner.resize(sizenode, ~0u);
 
+            // With DFFlag::LuauLongStringHash the VM hashes a key of 32 bytes or more with its own key: its slot is
+            // unknown here, and so are the conflicts of the table's other keys
+            std::vector<bool> slotKnown(shape.length, true);
+            bool conflictsKnown = true;
+
             for (unsigned i = 0; i < shape.length; ++i)
             {
                 const Constant& keyConst = constants[shape.keys[i]];
                 LUAU_ASSERT(keyConst.type == Constant::Type_String);
                 LUAU_ASSERT(keyConst.valueString != 0u);
                 const StringRef& str = debugStrings[keyConst.valueString - 1];
+
+                if (isStringHashKeyed(str.length))
+                {
+                    slotKnown[i] = false;
+                    conflictsKnown = false;
+                    continue;
+                }
 
                 slots[i] = getStringHash(str) & mask;
 
@@ -2424,9 +2436,12 @@ void BytecodeBuilder::dumpConstant(std::string& result, int k, bool detailed) co
                     dumpConstant(result, shape.constants[i], false);
                 }
 
-                formatAppend(result, " #%u", slots[i]);
+                if (!slotKnown[i])
+                    formatAppend(result, " #?");
+                else
+                    formatAppend(result, " #%u", slots[i]);
 
-                if (slotOwner[slots[i]] != i)
+                if (slotKnown[i] && conflictsKnown && slotOwner[slots[i]] != i)
                     formatAppend(result, " (conflict)");
             }
 
